@@ -1,5 +1,6 @@
 from datetime import date, datetime, timedelta
 import matplotlib.pyplot as plt
+import re
 import csv
 import pandas as pd
 from dateutil.relativedelta import relativedelta
@@ -132,6 +133,60 @@ def load_output() -> dict[str, float]:
             except ValueError:
                 continue
     return output
+
+
+def chart_hourly_output():
+    """Load hourly output estimate from output.csv
+
+    time,local_time,electricity,day,month
+    2019-01-01 0:00,2018-12-31 16:00,1.34,01-01,01 January,,,,,,,,,,,
+    from https://www.renewables.ninja
+    """
+    df = pd.read_csv(
+        "output_hourly.csv", parse_dates=["local_time"], dtype={"electricity": float}
+    )
+    df["hour"] = df["local_time"].dt.hour
+    plt.figure(figsize=(10, 6))  # create figure once
+    # color palette for up to 12 months
+    colors = [
+        "#a6cee3",
+        "#1f78b4",
+        "#b2df8a",
+        "#33a02c",
+        "#fb9a99",
+        "#e31a1c",
+        "#fdbf6f",
+        "#ff7f00",
+        "#cab2d6",
+        "#6a3d9a",
+        "#ffff99",
+        "#b15928",
+    ]
+    daily_by_month = {}
+    for i, (month, group) in enumerate(sorted(df.groupby("month"))):
+        # average value for electricity in group
+        days = len(group["day"].unique())
+        daily = round(group["electricity"].sum() / days)
+        group = group.groupby("hour").agg({"electricity": "mean"}).reset_index()
+        group = group.sort_values(by="hour")
+        month_name = re.sub(r"\d\d ", "", month)
+        color = colors[i % len(colors)]
+        plt.plot(
+            group["hour"],
+            group["electricity"],
+            label=f"{month_name} ({daily})",
+            color=color,
+            linewidth=2,
+        )
+    plt.xticks(range(0, 24, 1))  # set x ticks
+    plt.title("Average hourly solar output")
+    plt.xlabel("Hour")
+    plt.ylabel("kW")
+    plt.legend()
+    filename = "hourly_output_all_months.png"
+    plt.savefig(filename, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"wrote {filename}")
 
 
 def load_hourly_output() -> dict[str, float]:
@@ -585,19 +640,37 @@ def label_periods(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def main():
+def initial_setup():
     """
     Timestamp,kW
     8/13/2025 11:00 PM,0.92
     """
-    # df = pd.read_csv("2024-2025.csv", parse_dates=["Timestamp"], dtype={"kW": float})
-    # df.to_csv("actual.csv", index=False)
+    df = pd.read_csv("2024-2025.csv", parse_dates=["Timestamp"], dtype={"kW": float})
+    df.to_csv("actual.csv", index=False)
+    df["hour"] = pd.to_datetime(df["Timestamp"]).dt.hour
+    df["yyyymm"] = pd.to_datetime(df["Timestamp"]).dt.strftime("%Y-%m")
 
     # copy ev charging from 2025-04+ backwards
-    # df = add_ev(df)
-    # df.to_csv("charging.csv", index=False)
-    # load use with charging already applied
-    df = pd.read_csv("charging.csv", parse_dates=["Timestamp"], dtype={"kW": float})
+    df = add_ev(df)
+
+    df["hour"] = pd.to_datetime(df["Timestamp"]).dt.hour
+    for hour in range(0, 4):
+        df.loc[df["hour"] == hour, "Timestamp"] += pd.Timedelta(hours=12)
+        df.loc[df["hour"] == hour + 12, "Timestamp"] -= pd.Timedelta(hours=12)
+    # reset hour
+    df["hour"] = pd.to_datetime(df["Timestamp"]).dt.hour
+    # sort by Timestamp
+    df = df.sort_values(by="Timestamp").reset_index(drop=True)
+
+    df.to_csv("charging.csv", index=False)
+
+
+def _initial_setup():
+    return pd.read_csv("charging.csv", parse_dates=["Timestamp"], dtype={"kW": float})
+
+
+def main():
+    df = initial_setup()
     df = label_periods(df)
 
     # average daily use by period type
@@ -653,3 +726,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # chart_hourly_output()
