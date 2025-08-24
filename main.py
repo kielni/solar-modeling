@@ -28,7 +28,18 @@ https://www.franklinwh.com/products/apower2-home-battery-backup/
 2x  15kWh batteries = 27,300
 $910 per kWh
 """
+"""
+What happens in January
+- runs of solar output below daily use
+- battery drains to zero
+- grid use during peak hours
 
+options
+  - charge battery from grid? think so, need to confirm
+  - larger battery (now: 3x daily peak use)
+  - more solar: won't help when there is no sun; already sometimes get battery full
+  - use only during peak (ie constantly fiddle with settings)
+"""
 # capacity value used to generate hourly output
 # from https://www.renewables.ninja
 BASE_SOLAR_CAPACITY = 10
@@ -38,10 +49,15 @@ BASE_BATTERY_CAPACITY = 30
 # scale by command line args
 BATTERY_CAPACITY = BASE_BATTERY_CAPACITY
 
-# use battery in off peak if it's at least this level
-OFF_PEAK_BATTERY_LEVEL = 10
 # average is 10 but add a little margin
 OFF_PEAK_USAGE = 11
+
+# use battery in off peak if it's at least this level
+# might need all daily solar production to offset peak usage
+OFF_PEAK_BATTERY_LEVEL_WINTER = OFF_PEAK_USAGE
+# in summer, let battery go lower since it will likely refill
+OFF_PEAK_BATTERY_LEVEL_SUMMER = OFF_PEAK_USAGE / 2
+
 DAILY_USE = 42
 
 SHEET_ID = "1vSV4EjU8OsduAFK0HzzNbDCx9E8KZpzjp8XyiYHbehQ"
@@ -171,7 +187,7 @@ def load_output() -> dict[str, float]:
     return output
 
 
-def chart_hourly_output_month(df: pd.DataFrame, max_y: float):
+def chart_solar_hourly_by_month(df: pd.DataFrame, max_y: float):
     """Group by day. Plot one line per day with hour on x-axis and electricity on y-axis."""
     plt.figure(figsize=(10, 6))  # create figure once
     # get min, max, and median
@@ -216,14 +232,14 @@ def chart_hourly_output_month(df: pd.DataFrame, max_y: float):
     month_name = row["month_label"]
     month_num = row["month"]
     # add month name as title
-    plt.title(f"Hourly solar output {month_name}:  {SOLAR_CAPACITY} kW")
+    plt.title(f"Hourly solar output {month_name}:  {round(SOLAR_CAPACITY)} kW")
     filename = f"{get_output_dir()}/solar_hourly_{month_num:02d}_{month_name}.png"
     plt.savefig(filename, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"wrote {filename}")
 
 
-def chart_hourly_output():
+def chart_solar_hourly():
     """Load hourly output estimate from output.csv
 
     time,local_time,electricity,day,month
@@ -263,7 +279,7 @@ def chart_hourly_output():
     label_colors = []
     # chart: average by hour, one line per month
     for i, (month, group) in enumerate(sorted(df.groupby("month"))):
-        chart_hourly_output_month(group, max_y)
+        chart_solar_hourly_by_month(group, max_y)
         days = len(group["day"].unique())
         daily = round(group["electricity"].sum() / days)
         label_colors.append("black" if daily >= DAILY_USE else "red")
@@ -283,7 +299,7 @@ def chart_hourly_output():
     plt.title(f"Average hourly solar output: {round(SOLAR_CAPACITY)} kW system")
     plt.xlabel("Hour")
     plt.ylabel("kW")
-    legend = plt.legend(labelcolor=label_colors)
+    plt.legend(labelcolor=label_colors)
     # Set legend text color to red for under_months
     filename = f"{get_output_dir()}/solar_all_months.png"
     plt.savefig(filename, dpi=300, bbox_inches="tight")
@@ -348,6 +364,13 @@ class Flow(BaseModel):
     to_grid: float = Field(default=0.0)
 
 
+def min_battery_level(month: int) -> float:
+    """Return minimum battery level to maintain during off peak hours."""
+    if month >= 6 and month <= 9:
+        return OFF_PEAK_BATTERY_LEVEL_SUMMER
+    return OFF_PEAK_BATTERY_LEVEL_WINTER
+
+
 def calculate_v2(df: pd.DataFrame):
     hourly_output = load_hourly_output()
     rows = []
@@ -364,6 +387,7 @@ def calculate_v2(df: pd.DataFrame):
             ),
             start_battery_level=battery_level,
         )
+        min_battery = min_battery_level(flow.timestamp.month)
         period_type = row["period_type"]
         demand = flow.demand
         if period_type in ["peak", "part peak"]:
@@ -378,24 +402,25 @@ def calculate_v2(df: pd.DataFrame):
             # to grid
             excess = flow.solar_generation - flow.from_solar
             flow.to_battery = min(BATTERY_CAPACITY - flow.start_battery_level, excess)
-            flow.to_grid = excess - flow.to_battery
         else:
-            # solar to battery first
-            flow.to_battery = min(
-                flow.solar_generation, BATTERY_CAPACITY - flow.start_battery_level
-            )
-            battery_level = flow.start_battery_level + flow.to_battery
+            # first charge battery to OFF_PEAK_BATTERY_LEVEL
+            if flow.start_battery_level < min_battery:
+                flow.to_battery = min(
+                    BATTERY_CAPACITY - flow.start_battery_level,
+                    flow.solar_generation,
+                )
             # solar to demand next
             flow.from_solar = min(demand, flow.solar_generation - flow.to_battery)
             demand -= flow.from_solar
             # then from battery if battery is high enough
-            if battery_level > OFF_PEAK_BATTERY_LEVEL:
+            battery_level = flow.start_battery_level + flow.to_battery
+            if battery_level > min_battery:
                 flow.from_battery = min(demand, battery_level)
                 demand -= flow.from_battery
             # then from grid
             flow.from_grid = demand
             # to grid
-            flow.to_grid = flow.solar_generation - flow.from_solar - flow.to_battery
+        flow.to_grid = flow.solar_generation - flow.from_solar - flow.to_battery
         # update battery level
         flow.end_battery_level = (
             flow.start_battery_level - flow.from_battery + flow.to_battery
@@ -426,6 +451,7 @@ def calculate_v3(df: pd.DataFrame) -> pd.DataFrame:
             ),
             start_battery_level=battery_level,
         )
+        min_battery = min_battery_level(flow.timestamp.month)
         period_type = row["period_type"]
         demand = flow.demand
         # from solar first
@@ -444,9 +470,9 @@ def calculate_v3(df: pd.DataFrame) -> pd.DataFrame:
                 flow.to_battery = min(
                     BATTERY_CAPACITY - flow.start_battery_level, excess
                 )
-        else:
+        else:  # off peak
             # from battery if battery is high enough
-            if demand and battery_level > OFF_PEAK_BATTERY_LEVEL:
+            if demand and battery_level > min_battery:
                 flow.from_battery = min(demand, battery_level)
                 demand -= flow.from_battery
             if demand:
@@ -474,14 +500,170 @@ def calculate_v3(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def chart_flows(df: pd.DataFrame, month: str):
+def chart_demand(df: pd.DataFrame, ax):
+    # chart 1
+    # stack bars for from_solar, from_battery, from_grid
+    # solar line
+    ax.plot(
+        df["hour_label"],
+        df["solar_generation_mean"],
+        label="solar generation",
+        color="darkorange",
+    )
+    ax.fill_between(
+        df["hour_label"],
+        df["solar_generation_25"],
+        df["solar_generation_75"],
+        color="darkorange",
+        alpha=0.3,
+    )
+    # bar for solar
+    ax.bar(
+        df["hour_label"],
+        df["from_solar_mean"],
+        label="from solar",
+        color="yellow",
+    )
+    # bar for battery, on top of solar
+    ax.bar(
+        df["hour_label"],
+        df["from_battery_mean"],
+        label="from battery",
+        bottom=df["from_solar_mean"],
+        color="green",
+    )
+    # bar for from grid, on top of battery
+    ax.bar(
+        df["hour_label"],
+        df["from_grid_mean"],
+        label="from grid",
+        bottom=df["from_solar_mean"] + df["from_battery_mean"],
+        color="#00A5DF",
+    )
+    # demand line
+    ax.plot(df["hour_label"], df["demand_mean"], label="demand", color="black")
+    ax.legend()
+
+
+def chart_excess(df: pd.DataFrame, ax):
+    # chart 2: to_battery bar, to_grid bar, battery level line
+    # to battery
+    ax.bar(
+        df["hour_label"],
+        df["to_battery_mean"],
+        label="to battery",
+        color="lightgreen",
+    )
+    # to grid, on top of to_battery
+    ax.bar(
+        df["hour_label"],
+        df["to_grid_mean"],
+        label="to grid",
+        bottom=df["to_battery_mean"],
+        color="lightblue",
+    )
+    ax.legend()
+
+
+def chart_battery(df: pd.DataFrame, ax):
+    ax.plot(
+        df["hour_label"],
+        df["start_battery_level_25"],
+        color="lightgreen",
+    )
+    ax.plot(
+        df["hour_label"],
+        df["start_battery_level_75"],
+        color="lightgreen",
+    )
+    # shade space between 25th and 75th in light green
+    ax.fill_between(
+        df["hour_label"],
+        df["start_battery_level_25"],
+        df["start_battery_level_75"],
+        color="lightgreen",
+        alpha=0.5,
+    )
+    ax.plot(
+        df["hour_label"],
+        df["start_battery_level_mean"],
+        label="battery",
+        color="green",
+    )
+    ax.plot(df["hour_label"], df["demand_mean"], label="demand", color="black")
+    ax.legend()
+
+
+def chart_monthly_sources(df: pd.DataFrame):
+    """
+    group by month
+    for each group
+      sum by from_solar, from_battery, from_grid
+      create one stacked bar per month
+    """
+    fig, ax = plt.subplots(figsize=(12, 6))
+    df_monthly = df.groupby("month").agg(
+        {
+            "from_solar": "sum",
+            "from_battery": "sum",
+            "from_grid": "sum",
+            "to_grid": "sum",
+        }
+    )
+    df_monthly = df_monthly.reset_index()
+    df_monthly["month_label"] = df_monthly["month"].apply(
+        lambda x: datetime(2025, x, 1).strftime("%b")
+    )
+    # stack bars for from_solar, from_battery, from_grid
+    ax.bar(
+        df_monthly["month_label"],
+        df_monthly["from_solar"],
+        label="from solar",
+        color="yellow",
+    )
+    ax.bar(
+        df_monthly["month_label"],
+        df_monthly["from_battery"],
+        label="from battery",
+        bottom=df_monthly["from_solar"],
+        color="green",
+    )
+    ax.bar(
+        df_monthly["month_label"],
+        df_monthly["from_grid"],
+        label="from grid",
+        bottom=df_monthly["from_solar"] + df_monthly["from_battery"],
+        color="#00A5DF",
+    )
+    # draw to_grid as negative bar
+    ax.bar(
+        df_monthly["month_label"],
+        -df_monthly["to_grid"],
+        label="to grid (export)",
+        color="lightblue",
+        bottom=None,
+    )
+    ax.legend()
+    # label y axis as kWh
+    ax.set_ylabel("kWh")
+    ax.axhline(0, color="black", linewidth=1)
+    ax.set_title(
+        f"Sources by month:  {round(SOLAR_CAPACITY)} kW solar, {round(BATTERY_CAPACITY)} kWh battery"
+    )
+    ax.set_axisbelow(True)
+    ax.grid(axis="y", color="lightgray", alpha=0.7)
+    # draw horizontal line at y=0
+    # add title: Sources by month:  10 kW solar, 30 kWh battery
+    # draw horizontal grid lines
+    plt.tight_layout()
+    fig.savefig(f"{get_output_dir()}/monthly_sources.png", dpi=300, bbox_inches="tight")
+
+
+def chart_flows(df: pd.DataFrame, month: date, max_y: float):
     # positive: from_solar + from_battery + from_grid = demand
     # negative: to_battery + to_grid = excess
     # solar generation, demand
     # battery level
-    # get rows where yyyymm = 202507
-    df_month = df[df["yyyymm"] == month].sort_values(by="Timestamp")
-
     cols = [
         "from_solar",
         "from_battery",
@@ -490,83 +672,45 @@ def chart_flows(df: pd.DataFrame, month: str):
         "solar_generation",
         "to_battery",
         "to_grid",
+        "start_battery_level",
     ]
-    # average columns by hour_label
-    df_month = df_month.groupby("hour").agg({col: "mean" for col in cols})
-    title = f"{month[:4]}-{month[4:6]} flows"
-    fig, axs = plt.subplots(2, 1, figsize=(12, 8))
-    # chart 1
-    # draw full height bar  with light yellow color for hour=15, hour=21-23
-    # draw full height bar with light red color for hour=16-20
-    # stack bars for from_solar, from_battery, from_grid
-    max_y = df_month[cols].max().max() * 1.1
-    axs[0].set_ylim(0, max_y)
-    df_month["hour_label"] = df_month.index.astype(str)
-    """
-    for hour in [15, 21, 22, 23]:
-        axs[0].bar(
-            [hour],
-            [max_y],
-            color="lightyellow",
-        )
-    for hour in [16, 17, 18, 19, 20]:
-        axs[0].bar(
-            [hour],
-            [max_y],
-            color="lightcoral",
-        )
-    """
+    df_hourly = (
+        df.groupby("hour")[cols]
+        .quantile([0.25, 0.5, 0.75])  # 25th, median, 75th
+        .unstack(level=-1)  # move quantiles into columns
+    )
+    df_hourly.columns = [f"{col}_{int(q * 100)}" for col, q in df_hourly.columns]
+    df_hourly["hour_label"] = df_hourly.index.astype(str)
+
+    # get mean by hour
+    df_hourly_mean = df.groupby("hour").agg({col: "mean" for col in cols})
+    df_hourly_mean.columns = [f"{col}_mean" for col in cols]
+    df_hourly_mean["hour_label"] = df_hourly_mean.index.astype(str)
+    df_hourly = pd.merge(df_hourly, df_hourly_mean, on="hour_label", how="left")
+
+    fig, axs = plt.subplots(3, 1, figsize=(12, 8))
     for ax in axs:
+        ax.set_ylim(0, max_y)
+        ax.set_xlim(-0.5, 23.5)
+        # part peak: with light yellow color for hour=15, hour=21-23
         ax.axvspan(15, 24, color="lightyellow", alpha=1.0)
+        # peak: full height bar with light red color for hour=16-20
         ax.axvspan(16, 20, color="lightcoral", alpha=0.5)
-    axs[0].bar(
-        df_month["hour_label"],
-        df_month["from_solar"],
-        label="from_solar",
-        color="yellow",
-    )
-    axs[0].bar(
-        df_month["hour_label"],
-        df_month["from_battery"],
-        label="from_battery",
-        bottom=df_month["from_solar"],
-        color="green",
-    )
-    axs[0].bar(
-        df_month["hour_label"],
-        df_month["from_grid"],
-        label="from_grid",
-        bottom=df_month["from_solar"] + df_month["from_battery"],
-        color="blue",
-    )
-    axs[0].plot(df_month["hour_label"], df_month["demand"], label="demand")
-    axs[0].plot(
-        df_month["hour_label"], df_month["solar_generation"], label="solar_generation"
-    )
-    # set colors: solar = yellow, battery = green, grid = blue, demand = red, solar_generation = orange
-    axs[0].legend()
-    # chart 2
-    # chart 2: to_battery bar, to_grid bar, battery level line
-    axs[1].bar(
-        df_month["hour_label"],
-        df_month["to_battery"],
-        label="to_battery",
-        color="lightgreen",
-    )
-    axs[1].bar(
-        df_month["hour_label"],
-        df_month["to_grid"],
-        label="to_grid",
-        bottom=df_month["to_battery"],
-        color="lightblue",
-    )
-    # axs[1].plot(df_month["hour_label"], df_month["battery_level"], label="battery_level")
-    axs[1].legend()
+        ax.set_axisbelow(True)
+        ax.grid(axis="y", color="lightgray", alpha=0.7)
+
+    chart_battery(df_hourly, axs[2])
+    # consistent axis limit for all months
+    chart_demand(df_hourly, axs[0])
+    chart_excess(df_hourly, axs[1])
+    axs[2].set_ylim(0, BATTERY_CAPACITY * 1.05)
     plt.tight_layout()
-    plt.title(title)
-    # plt.show()
-    # save to month.png
-    fig.savefig(f"{get_output_dir()}/{month}.png", dpi=300, bbox_inches="tight")
+    month_name = month.strftime("%B")
+    plt.suptitle(f"Flows {month_name}:  {round(SOLAR_CAPACITY)} kW", y=1.00)
+    month_name = month.strftime("%m_%B")
+    fig.savefig(
+        f"{get_output_dir()}/flow_{month_name}.png", dpi=300, bbox_inches="tight"
+    )
 
 
 def with_solar(df: pd.DataFrame) -> pd.DataFrame:
@@ -764,6 +908,7 @@ def write_to_sheet(df: pd.DataFrame):
     # keep only cols
     df = df[cols]
     print(df.columns.values.tolist())
+    df.to_csv(f"{get_output_dir()}/flows-model.csv", index=False)
     ss = open_spreadsheet()
     worksheet = ss.worksheet("model")
     worksheet.update(
@@ -866,34 +1011,15 @@ def get_output_dir():
     return f"solar-{round(SOLAR_CAPACITY)}-battery-{round(BATTERY_CAPACITY)}"
 
 
-def main():
-    df = initial_setup()
-    df = label_periods(df)
-
-    # average daily use by period type
-    print("average daily use by period")
-    daily = df.groupby(["ymd", "period_type"]).agg({"kW ev": "sum"}).reset_index()
-    average = daily.groupby("period_type")["kW ev"].mean()
-    for period_type, avg_kw in average.items():
-        print(f"{period_type}\t{round(avg_kw)} kWh")
-    print("\n")
-
-    # add battery and grid use
-    # df = with_solar(df)
-    # df = calculate_v2(df)
-    df = calculate_v3(df)
-    df = add_costs(df)
-
+def output(df: pd.DataFrame):
     """
     Timestamp,kW,kW ev,month,hour,yyyymm,ymd,season,period,period_type,
     kW grid use,kW battery use peak,kW battery use part peak,kW battery use off peak,excess,
     ELEC,credit per kWh,service charge,pge cost ELEC,net cost ELEC,savings,EV2-A,pge cost EV2-A,net cost EV2-A
     """
-    """
     df.to_csv("cost.csv", index=False)
     df_daily = df.groupby("ymd").agg({col: "sum" for col in cost_cols}).reset_index()
     df_daily.to_csv("cost_daily.csv", index=False)
-
 
     # group by monthly
     daily_sums = [
@@ -914,12 +1040,63 @@ def main():
     print(df_monthly, "\n")
     for key in cost_cols:
         total = df_monthly[key].sum()
-        print(f"{key}\t${total:,.0f}")x
-    """
+        print(f"{key}\t${total:,.0f}")
+
+
+def print_summary(df: pd.DataFrame):
+    # average daily use by period type
+    print("average daily use by period")
+    daily = df.groupby(["ymd", "period_type"]).agg({"kW ev": "sum"}).reset_index()
+    average = daily.groupby("period_type")["kW ev"].mean()
+    for period_type, avg_kw in average.items():
+        print(f"{period_type}\t{round(avg_kw)} kWh")
+    print("\n")
+    # pge cost ELEC, net cost ELEC,
+    # pge cost EV2-A, net cost EV2-A
+    print(f"solar capacity\t{round(SOLAR_CAPACITY)} kW")
+    print(f"battery capacity\t{round(BATTERY_CAPACITY)} kWh")
+    print(
+        f"min battery level\tsummer={round(OFF_PEAK_BATTERY_LEVEL_SUMMER)} kWh\twinter={round(OFF_PEAK_BATTERY_LEVEL_WINTER)} kWh"
+    )
+    print("\ntariff\tPG&E\tnet cost\tsavings")
+    for tariff in RATE_VALUES.keys():
+        pge_cost = df[f"pge cost {tariff}"].sum()
+        net_cost = df[f"net cost {tariff}"].sum()
+        savings = df[f"savings {tariff}"].sum()
+        print(f"{tariff}\t${pge_cost:,.0f}\t${net_cost:,.0f}\t${savings:,.0f}")
+    print("\n")
+    # TODO: write summary stats
+    # demand, solar production, to grid
+    demand = df["demand"].sum()
+    solar = df["solar_generation"].sum()
+    to_grid = df["to_grid"].sum()
+    waste = to_grid * 0.28
+    print(f"demand\t{demand:,.0f} kWh")
+    print(f"solar production\t{solar:,.0f} kWh")
+    print(f"to grid\t{to_grid:,.0f} kWh")
+    print(f"waste value\t${waste:,.0f}")
+
+
+def main():
+    df = initial_setup()
+    df = label_periods(df)
+
+    # df = with_solar(df)
+    # df = calculate_v2(df)
+    df = calculate_v3(df)
+    df = add_costs(df)
+
     # create_cost_chart(df)
-    write_to_sheet(df)
-    for month in df["yyyymm"].unique():
-        chart_flows(df, month)
+    # write_to_sheet(df)
+    max_y = df[["demand", "solar_generation"]].max().max() * 1.1
+    df = df.sort_values(by="Timestamp")
+
+    chart_monthly_sources(df)
+    # chart for each month
+    for month, group in df.groupby(df["month"]):
+        chart_flows(group, date(2025, month, 1), max_y=max_y)
+
+    print_summary(df)
 
 
 if __name__ == "__main__":
@@ -931,5 +1108,5 @@ if __name__ == "__main__":
     output_dir = get_output_dir()
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    # main()
-    chart_hourly_output()
+    main()
+    # chart_solar_hourly()
