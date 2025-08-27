@@ -2,23 +2,23 @@ import glob
 import os
 import yaml
 import pandas as pd
-import numpy_financial
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 import matplotlib.dates as mdates
 
+from util import COLORS
+
 
 def chart_cumulative(paths: dict[str, str]):
     fig, ax = plt.subplots(figsize=(12, 6))
-    chart_pge = True
     colors = [
         "#66c2a5",
         "#fc8d62",
         "#8da0cb",
     ]
-    df = pd.read_csv("summary.csv")
+    df = pd.read_csv("output/summary.csv")
     labels = {}
-    for index, row in df.iterrows():
+    for _, row in df.iterrows():
         labels[row["scenario"]] = (
             f"{row['scenario']} {row['payback period']:.1f} years {row['IRR']:.2%}"
         )
@@ -49,16 +49,16 @@ def chart_cumulative(paths: dict[str, str]):
     ax.xaxis.set_major_locator(mdates.YearLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
     ax.legend()
-    df = pd.read_csv("summary.csv")
+    df = pd.read_csv("output/summary.csv")
     df = df.sort_values(by="IRR", ascending=False)
     plt.tight_layout()
-    filename = "roi.png"
+    filename = "output/roi.png"
     fig.savefig(filename, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
 
 def summarize_periods(path: str):
-    """
+    """Summarize use and cost by period.
 
     Timestamp,kW,hour,yyyymm,kW ev,month,day,ymd,season,period,period_type,
     solar_efficiency,timestamp,demand,start_battery_level,end_battery_level,
@@ -69,28 +69,43 @@ def summarize_periods(path: str):
     """
     df = pd.read_csv(f"{path}/costs.csv")
     cols = ["period", "demand", "pge cost EV2-A"]
-    df = df[cols]
+    df_periods = df[cols]
     # group by period and sum cost and demand
-    df = df.groupby("period").sum()
+    df_periods = df_periods.groupby("period").sum()
     # percent of demand by period, percent of cost by period
-    df["demand percent"] = df["demand"] / df["demand"].sum()
-    df["cost percent"] = df["pge cost EV2-A"] / df["pge cost EV2-A"].sum()
+    df_periods["demand percent"] = df_periods["demand"] / df_periods["demand"].sum()
+    df_periods["cost percent"] = (
+        df_periods["pge cost EV2-A"] / df_periods["pge cost EV2-A"].sum()
+    )
     # sort by period
-    df = df.sort_values(by="period")
+    df_periods = df_periods.sort_values(by="period")
     print("\nUse and cost by period")
     print("period\tuse %\tcost %\tcost $")
-    for period, row in df.iterrows():
+    for period, row in df_periods.iterrows():
         print(
             f"{period}\t{row['demand percent']:.0%}\t{row['cost percent']:.0%}\t"
             f"{row['pge cost EV2-A']:,.0f}"
         )
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar(df_periods.index, df_periods["cost percent"], color=COLORS["system"])
+    ax.set_title("Cost by period")
+    ax.set_xlabel("Period")
+    ax.set_ylabel("Cost")
+    ax.grid(axis="y", color="lightgray", alpha=0.7)
+    ax.set_axisbelow(True)
+    # format y axis as percentage
+    ax.yaxis.set_major_formatter(mtick.FuncFormatter(lambda x, p: f"{x:.0%}"))
+    plt.tight_layout()
+    filename = "output/periods.png"
+    plt.savefig(filename, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {filename}")
 
 
 def chart_daily_actual():
-    df = pd.read_csv("actual.csv", parse_dates=["Timestamp"])
+    df = pd.read_csv("data/actual.csv", parse_dates=["Timestamp"])
     df["date"] = pd.to_datetime(df["Timestamp"]).dt.date
     df = df.groupby("date")["kW"].sum().reset_index().sort_values(by="date")
-    # chart
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.bar(df["date"], df["kW"], color="#FE6033")
     ax.set_title("Daily demand")
@@ -98,6 +113,7 @@ def chart_daily_actual():
     ax.set_ylabel("Demand")
     ax.grid(axis="y", color="lightgray", alpha=0.7)
     ax.set_axisbelow(True)
+    ax.set_xlim(df["date"].min(), df["date"].max())
     plt.tight_layout()
     filename = "output/daily_demand.png"
     plt.savefig(filename, dpi=300, bbox_inches="tight")
@@ -125,11 +141,12 @@ def main():
         df = pd.concat([df, summary])
     # sort by savings EV2-A
     df = df.sort_values(by="savings EV2-A")
-    df.to_csv("summary.csv", index=False)
-
-    for index, row in df.iterrows():
+    df.to_csv("output/summary.csv", index=False)
+    print("scenario\tsolar\tsavings EV2-A\tpayback period\tIRR")
+    for _, row in df.iterrows():
+        solar_pct = 1 - (row["from grid"] / row["demand"])
         print(
-            f"{row['scenario']}\t\t{row['solar']:,.0f}\t{row['to grid']:,.0f}\t{row['savings EV2-A']:,.0f}"
+            f"{row['scenario']}\t{solar_pct:.0%}\t{row['savings EV2-A']:,.0f}\t{row['payback period']:.1f}\t{row['IRR']:.2%}"
         )
     chart_cumulative(paths)
     summarize_periods(list(paths.keys())[0])

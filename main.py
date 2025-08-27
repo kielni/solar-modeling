@@ -1,20 +1,23 @@
 import argparse
-import os
+import csv
 from datetime import date, datetime, timedelta
+import os
+
+from dateutil.relativedelta import relativedelta
+import gspread
+from gspread import Spreadsheet
+from gspread.utils import ValueInputOption
 from matplotlib import style
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 import matplotlib.dates as mdates
-import csv
-import pandas as pd
-from dateutil.relativedelta import relativedelta
-from pydantic import BaseModel, Field
-import gspread
-from gspread import Spreadsheet
-from gspread.utils import ValueInputOption
-import yaml
 import numpy as np
 import numpy_financial
+import pandas as pd
+from pydantic import BaseModel, Field
+import yaml
+
+from util import COLORS
 
 # https://www.pge.com/assets/pge/docs/account/rate-plans/residential-electric-rate-plan-pricing.pdf
 
@@ -120,20 +123,6 @@ Summer Season: June-September
 0.48 Partial-peak (3-4 p.m. and 9 p.m. - 12 midnight)
 """
 
-COLORS = {
-    "from_solar": "#FDC451",
-    "from_battery": "#167590",
-    "from_grid": "#FE6033",
-    "to_grid": "#8E0B59",
-    "to_battery": "#25A9D0",
-    # test these
-    "solar_generation": "orange",
-    "battery_level": "darkgreen",
-    "system": "#1a9641",
-    "savings": "#018571",
-    "part peak": "lightyellow",
-    "peak": "lightcoral",
-}
 
 MONTH_COLORS = [
     "#a6cee3",
@@ -233,7 +222,7 @@ def load_output() -> dict[str, float]:
     from https://www.renewables.ninja
     """
     output: dict[str, float] = {}
-    with open("output.csv") as f:
+    with open("data/output.csv") as f:
         for line in f.readlines():
             if not line:
                 continue
@@ -247,7 +236,6 @@ def load_output() -> dict[str, float]:
 
 def chart_solar_hourly_by_month(df: pd.DataFrame, max_y: float):
     """Group by day. Plot one line per day with hour on x-axis and electricity on y-axis."""
-    plt.figure(figsize=(10, 6))  # create figure once
     # get min, max, and median
     per_day = df.groupby("day").agg({"electricity": "sum"})
     min_val = round(per_day["electricity"].min())
@@ -261,10 +249,10 @@ def chart_solar_hourly_by_month(df: pd.DataFrame, max_y: float):
         f"{days_over_use} days ({over_pct})% ≥ {DAILY_USE} kWh"
     )
     plt.text(
-        0.99,
+        0.01,
         0.95,
         stats_text,
-        ha="right",
+        ha="left",
         va="top",
         transform=plt.gca().transAxes,
         fontsize=10,
@@ -286,6 +274,7 @@ def chart_solar_hourly_by_month(df: pd.DataFrame, max_y: float):
     plt.title("Average hourly solar output")
     plt.xlabel("Hour")
     plt.ylabel("kW")
+    highlight_peak(plt.gca())
     row = df.iloc[0]
     month_name = row["month_label"]
     month_num = row["month"]
@@ -301,7 +290,9 @@ def chart_solar_hourly_by_month(df: pd.DataFrame, max_y: float):
 def chart_solar_hourly():
     """Chart solar output by hour for all months."""
     df = pd.read_csv(
-        "output_hourly.csv", parse_dates=["local_time"], dtype={"electricity": float}
+        "data/output_hourly.csv",
+        parse_dates=["local_time"],
+        dtype={"electricity": float},
     )
     columns = ["local_time", "electricity"]
     df = df[columns]
@@ -353,6 +344,42 @@ def chart_solar_hourly():
     )
 
 
+def load_export():
+    """
+    RateLookupID Column:
+        If the RateLookupID includes “USCA-PGXX” that indicates Delivery Export Rates.
+        If the RateLookupID includes “USCA-XXPG” that indicate Generation Export Rates*.
+        *Generation Export Rates are only applicable to SBP customers that receive
+        bundled generation service from PG&E. Customers that receive generation service from a Community Choice Aggregator (CCA) or a Direct Access (DA) provider should refer to that generation service provider for more information about the generation export pricing available to them.
+
+    RateName Column:
+        The number that follows “NBT” represents the legacy pricing for that year.
+        Please see first paragraph for a description.
+
+    Dates and Times Columns:
+        DateStart, TimeStart, DateEnd and TimeEnd values are in
+        Coordinated Universal Time (UTC).
+
+    DayStart, DayEnd and ValueName are in Pacific Prevailing Time:
+        -	These fields indicate the effective day-type categories of the
+            rate factor
+        -	Monday through Sunday are represented as 1-7. Holidays are listed
+            as number “8” in the DayStart and DayEnd columns.
+        -	ValueName Column indicates the month and weekday hour or weekend
+        hour starting value for the rate factor.
+
+    Value and Unit Columns:
+        This represents the dollar amount pricing per export kWh.
+    """
+    df = pd.read_csv("data/pge-export.csv")
+    df = df[df["RIN"].str.contains("USCA-XXPG")]
+    cols = ["DateStart", "TimeStart", "Value"]
+    df = df[cols]
+    df["DateTime"] = pd.to_datetime(df["DateStart"] + " " + df["TimeStart"])
+    # TODO: UTC to PST/PDT
+    # write to output/pge-export.csv
+
+
 def load_hourly_output() -> dict[str, float]:
     """Load hourly output estimate from output_hourly.csv
 
@@ -362,7 +389,7 @@ def load_hourly_output() -> dict[str, float]:
     return a dict of hour: kWh
     """
     output: dict[str, float] = {}
-    reader = csv.DictReader(open("output_hourly.csv"))
+    reader = csv.DictReader(open("data/output_hourly.csv"))
     for row in reader:
         # 2018-12-31 16:00
         hour = row["local_time"][5:]
@@ -409,6 +436,20 @@ def min_battery_level(month: int) -> float:
     if month >= 6 and month <= 9:
         return MIN_BATTERY_SUMMER
     return MIN_BATTERY_WINTER
+
+
+"""
+https://sunwatts.com/content/manual/franklin_System_User_Manual.pdf
+
+ the homeowner can select the Time of Use mode to customize the on-peak and
+off-peak times according to the electricity rate. The FranklinWH system will select solar
+and aPower battery power during peak rate periods. During the off-peak periods, the
+system will use power from the grid, the PV system, and the batteries in balance according
+to household loads
+
+One or two time periods may be set for every 24
+hours, to achieve the most economical use of electricity for Smart Circuits.
+"""
 
 
 def calculate_v3(
@@ -494,9 +535,7 @@ def calculate_v3(
 
 
 def chart_demand(df: pd.DataFrame, ax):
-    # chart 1
-    # stack bars for from_solar, from_battery, from_grid
-    # solar line
+    """Chart demand, solar generation, and sources."""
     ax.plot(
         df["hour_label"],
         df["solar_generation_mean"],
@@ -508,7 +547,22 @@ def chart_demand(df: pd.DataFrame, ax):
         df["solar_generation_25"],
         df["solar_generation_75"],
         color=COLORS["solar_generation"],
-        alpha=0.3,
+        alpha=0.4,
+    )
+    # draw dashed line at solar_generation_25 and solar_generation_75
+    ax.plot(
+        df["hour_label"],
+        df["solar_generation_25"],
+        color=COLORS["solar_generation"],
+        linestyle="--",
+        linewidth=1,
+    )
+    ax.plot(
+        df["hour_label"],
+        df["solar_generation_75"],
+        color=COLORS["solar_generation"],
+        linestyle="--",
+        linewidth=1,
     )
     # bar for solar
     ax.bar(
@@ -567,11 +621,13 @@ def chart_battery(df: pd.DataFrame, ax):
         df["hour_label"],
         df["start_battery_level_25"],
         color=COLORS["battery_level"],
+        linestyle="--",
     )
     ax.plot(
         df["hour_label"],
         df["start_battery_level_75"],
         color=COLORS["battery_level"],
+        linestyle="--",
     )
     # shade space between 25th and 75th
     ax.fill_between(
@@ -579,7 +635,7 @@ def chart_battery(df: pd.DataFrame, ax):
         df["start_battery_level_25"],
         df["start_battery_level_75"],
         color=COLORS["battery_level"],
-        alpha=0.3,
+        alpha=0.5,
     )
     ax.plot(
         df["hour_label"],
@@ -657,6 +713,16 @@ def chart_monthly_sources(df: pd.DataFrame):
     plt.close(fig)
 
 
+def highlight_peak(ax: plt.Axes):
+    ax.set_xlim(-0.5, 23.5)
+    # part peak: with light yellow color for hour=15, hour=21-23
+    ax.axvspan(15, 24, color=COLORS["part peak"], alpha=1.0)
+    # peak: full height bar with light red color for hour=16-20
+    ax.axvspan(16, 20, color=COLORS["peak"], alpha=0.5)
+    ax.set_axisbelow(True)
+    ax.grid(axis="y", color="lightgray", alpha=0.7)
+
+
 def chart_flows(df: pd.DataFrame, month: date, max_y: float):
     # positive: from_solar + from_battery + from_grid = demand
     # negative: to_battery + to_grid = excess
@@ -689,14 +755,7 @@ def chart_flows(df: pd.DataFrame, month: date, max_y: float):
 
     fig, axs = plt.subplots(2, 1, figsize=(12, 8))
     for ax in axs:
-        ax.set_xlim(-0.5, 23.5)
-        # part peak: with light yellow color for hour=15, hour=21-23
-        ax.axvspan(15, 24, color=COLORS["part peak"], alpha=1.0)
-        # peak: full height bar with light red color for hour=16-20
-        ax.axvspan(16, 20, color=COLORS["peak"], alpha=0.5)
-        ax.set_axisbelow(True)
-        ax.grid(axis="y", color="lightgray", alpha=0.7)
-
+        highlight_peak(ax)
     chart_battery(df_hourly, axs[1])
     min_y = (df_hourly["to_grid_mean"] + df_hourly["to_battery_mean"]).max() * 1.05
     axs[0].set_ylim(-min_y, max_y)
@@ -704,7 +763,7 @@ def chart_flows(df: pd.DataFrame, month: date, max_y: float):
     chart_excess(df_hourly, axs[0])
     axs[1].set_ylim(0, BATTERY_CAPACITY * 1.05)
     plt.tight_layout()
-    plt.suptitle(f"Flows {month.strftime('%B')}: {round(SOLAR_CAPACITY)} kW", y=1.00)
+    plt.suptitle(f"{month.strftime('%B')} hourly: {label_from_params()}", y=1.00)
     fig.savefig(
         f"{get_output_dir()}/flow_{month_label(month)}.png",
         dpi=300,
@@ -845,8 +904,10 @@ def _initial_setup() -> pd.DataFrame:
     Timestamp,kW
     8/13/2025 11:00 PM,0.92
     """
-    df = pd.read_csv("2024-2025.csv", parse_dates=["Timestamp"], dtype={"kW": float})
-    df.to_csv("actual.csv", index=False)
+    df = pd.read_csv(
+        "data/2024-2025.csv", parse_dates=["Timestamp"], dtype={"kW": float}
+    )
+    df.to_csv("data/actual.csv", index=False)
     df["hour"] = pd.to_datetime(df["Timestamp"]).dt.hour
     df["yyyymm"] = pd.to_datetime(df["Timestamp"]).dt.strftime("%Y-%m")
 
@@ -861,7 +922,7 @@ def _initial_setup() -> pd.DataFrame:
     df["hour"] = pd.to_datetime(df["Timestamp"]).dt.hour
     # sort by Timestamp
     df = df.sort_values(by="Timestamp").reset_index(drop=True)
-    df.to_csv("charging.csv", index=False)
+    df.to_csv("data/charging.csv", index=False)
     return df
 
 
@@ -870,7 +931,9 @@ def initial_setup():
 
     Timestamp,kW,hour,yyyymm,kW ev
     """
-    return pd.read_csv("charging.csv", parse_dates=["Timestamp"], dtype={"kW": float})
+    return pd.read_csv(
+        "data/charging.csv", parse_dates=["Timestamp"], dtype={"kW": float}
+    )
 
 
 def get_output_dir():
@@ -909,6 +972,7 @@ def print_summary(df: pd.DataFrame, config: dict, payback_period: float, irr: fl
     lines.append("## Annual values\n")
     # demand, solar production, to grid
     demand = df["demand"].sum()
+    from_grid = df["from_grid"].sum()
     solar = df["solar_generation"].sum()
     to_grid = df["to_grid"].sum()
     waste = to_grid * 0.28
@@ -920,6 +984,7 @@ def print_summary(df: pd.DataFrame, config: dict, payback_period: float, irr: fl
     lines.append(f"IRR\t{irr:.2%}")
     row["demand"] = demand
     row["solar"] = solar
+    row["from grid"] = from_grid
     row["to grid"] = to_grid
     row["waste value"] = waste
     row["payback period"] = payback_period
@@ -933,11 +998,17 @@ def print_summary(df: pd.DataFrame, config: dict, payback_period: float, irr: fl
     df_summary.to_csv(f"{get_output_dir()}/summary.csv", index=False)
 
 
+def source_label(df: pd.DataFrame, col: str) -> int:
+    percent = round(df[col].sum() / df["demand"].sum() * 100)
+    return f"({percent}%)"
+
+
 def chart_daily(df: pd.DataFrame, month: date):
     print(f"writing daily chart for {month.strftime('%B')}")
     # chart 1: battery, solar, demand, excess
     # sort by Timestamp
     df = df.sort_values(by="Timestamp")
+    # demand = df["demand"].sum()
     cols = [
         "demand",
         "solar_generation",
@@ -954,36 +1025,40 @@ def chart_daily(df: pd.DataFrame, month: date):
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.set_xlim(0, 31.5)
     # lines for battery level, demand, solar generation
+    # TODO: increase resolution of battery level
+    # add day + fraction column
     ax.plot(
         df_daily["day"],
         df_daily["start_battery_level"],
-        label="battery level",
+        label=f"battery level",
         color=COLORS["battery_level"],
+        linewidth=2,
     )
     ax.plot(
         df_daily["day"],
         df_daily["solar_generation"],
         label="solar generation",
         color=COLORS["solar_generation"],
+        linewidth=2,
     )
     # bars for sources
     ax.bar(
         df_daily["day"],
         df_daily["from_solar"],
-        label="from solar",
+        label=f"from solar {source_label(df, 'from_solar')}",
         color=COLORS["from_solar"],
     )
     ax.bar(
         df_daily["day"],
         df_daily["from_battery"],
-        label="from battery",
+        label=f"from battery {source_label(df, 'from_battery')}",
         color=COLORS["from_battery"],
         bottom=df_daily["from_solar"],
     )
     ax.bar(
         df_daily["day"],
         df_daily["from_grid"],
-        label="from grid",
+        label=f"from grid {source_label(df, 'from_grid')}",
         color=COLORS["from_grid"],
         bottom=df_daily["from_solar"] + df_daily["from_battery"],
     )
@@ -991,14 +1066,14 @@ def chart_daily(df: pd.DataFrame, month: date):
     ax.bar(
         df_daily["day"],
         -df_daily["to_grid"],
-        label="to grid",
+        label=f"to grid",
         color=COLORS["to_grid"],
         bottom=None,
     )
     # label y axis as kWh
     ax.set_ylabel("kWh")
     ax.axhline(0, color="black", linewidth=1)
-    ax.set_title(f"{month.strftime('%B')} sources: {label_from_params()}")
+    ax.set_title(f"{month.strftime('%B')}: {label_from_params()}")
     ax.set_axisbelow(True)
     ax.grid(axis="y", color="lightgray", alpha=0.7)
     plt.tight_layout()
@@ -1024,12 +1099,13 @@ def chart_costs(df: pd.DataFrame):
 
     Add total savings for the year as a text box.
     """
+    tariff = "EV2-A"
     fig, ax = plt.subplots(figsize=(12, 6))
-    # group by month and sum pge cost ELEC and net cost ELEC
+    # group by month and sum pge cost EV2-A and net cost EV2-A
     df = df.sort_values(by="Timestamp")
     df_monthly = (
         df.groupby("month")
-        .agg({"pge cost ELEC": "sum", "net cost ELEC": "sum"})
+        .agg({f"pge cost {tariff}": "sum", f"net cost {tariff}": "sum"})
         .reset_index()
         .sort_values(by="month")
     )
@@ -1039,14 +1115,14 @@ def chart_costs(df: pd.DataFrame):
     width = 0.35
     ax.bar(
         x - width / 2,
-        df_monthly["pge cost ELEC"],
+        df_monthly[f"pge cost {tariff}"],
         width,
         label="PG&E",
         color=COLORS["from_grid"],
     )
     ax.bar(
         x + width / 2,
-        df_monthly["net cost ELEC"],
+        df_monthly[f"net cost {tariff}"],
         width,
         label="solar + battery",
         color=COLORS["system"],
@@ -1059,8 +1135,31 @@ def chart_costs(df: pd.DataFrame):
     ax.set_axisbelow(True)
     ax.set_xlim(-0.5, 11.5)
     ax.set_ylabel("cost $")
-    total_savings = df["savings ELEC"].sum()
-    ax.set_title(f"{label_from_params()} bills: ${total_savings:,.0f} annual savings")
+    total_savings = df[f"savings {tariff}"].sum()
+    savings_pct = round(
+        df[f"net cost {tariff}"].sum() / df[f"pge cost {tariff}"].sum() * 100
+    )
+    # group by month, sum net cost EV2-A
+    by_month = df.groupby("month").agg({"net cost EV2-A": "sum"})
+    monthly_bill = by_month["net cost EV2-A"].mean()
+    ax.set_title(f"{tariff} cost: {label_from_params()}")
+
+    text = (
+        f"${total_savings:,.0f} annual savings\n"
+        f"${monthly_bill:,.0f} average monthly bill\n"
+        f"{savings_pct}% of PG&E cost\n"
+    )
+    plt.text(
+        0.5,
+        0.95,
+        text,
+        ha="center",
+        va="top",
+        transform=plt.gca().transAxes,
+        fontsize=12,
+        color="black",
+        bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+    )
     plt.tight_layout()
     fig.savefig(f"{get_output_dir()}/costs.png", dpi=300, bbox_inches="tight")
     print(f"wrote costs to {get_output_dir()}/costs.png")
