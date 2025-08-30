@@ -12,15 +12,25 @@ from util import COLORS
 def chart_cumulative(paths: dict[str, str]):
     fig, ax = plt.subplots(figsize=(12, 6))
     colors = [
-        "#66c2a5",
-        "#fc8d62",
-        "#8da0cb",
+        "#a6cee3",
+        "#1f78b4",
+        "#b2df8a",
+        "#33a02c",
+        "#fb9a99",
+        "#e31a1c",
+        "#fdbf6f",
+        "#ff7f00",
+        "#cab2d6",
+        "#6a3d9a",
+        "#ffff99",
+        "#b15928",
     ]
     df = pd.read_csv("output/summary.csv")
     labels = {}
     for _, row in df.iterrows():
         labels[row["scenario"]] = (
-            f"{row['scenario']} {row['payback period']:.1f} years {row['IRR']:.2%}"
+            f"{row['scenario']}: {row['payback period']:.1f} years; "
+            f"{row['annual rate increase']:.0%} rate increase; {row['IRR']:.2%}"
         )
 
     for i, path in enumerate(paths):
