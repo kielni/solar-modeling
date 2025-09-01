@@ -1,8 +1,43 @@
+import argparse
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 from datetime import date, timedelta
 from dateutil.relativedelta import relativedelta
+from util import RATE_VALUES
+
+
+def daily_arbitrage_targets(tariff: str) -> pd.DataFrame:
+    df = pd.read_csv("data/pge-export-pt.csv", parse_dates=["DateTime"])
+    # get the max rate for each day
+    df["date"] = pd.to_datetime(df["DateTime"]).dt.date
+    df["total credit"] = df["generation credit"] + df["delivery credit"]
+    print(f"{len(df)} total hours")
+    # first drop everything below off peak
+    df = df[df["total credit"] > 0.31]
+    print(f"{len(df)} credit above off peak")
+    df = df.loc[df.groupby("date")["total credit"].idxmax()]
+    df["month"] = pd.to_datetime(df["DateTime"]).dt.month
+    df["date"] = pd.to_datetime(df["DateTime"]).dt.date
+    df["hour"] = pd.to_datetime(df["DateTime"]).dt.hour
+    # set date to date portion of DateTime
+    # set season to summer if month is between 6 and 9 else winter
+    df["season"] = "winter"
+    df.loc[df["month"].between(6, 9), "season"] = "summer"
+    winter_max = RATE_VALUES[tariff]["winter peak"]
+    summer_max = RATE_VALUES[tariff]["summer peak"]
+    # set target to max rate for the season
+    df["target"] = winter_max
+    df.loc[df["season"] == "summer", "target"] = summer_max
+    df = df[df["total credit"] > df["target"]]
+    df = df.sort_values(by="date")
+    # DateTime,generation credit,delivery credit,date,total credit,month,season,target
+    print(f"{len(df)} arbitrage target days")
+    filename = "data/arbitrage_targets.csv"
+    print(f"writing arbitrage targets to {filename}")
+    df.to_csv(filename, index=False)
+    df = df[["DateTime", "date", "hour"]]
+    return df
 
 
 def copy_charging() -> pd.DataFrame:
@@ -65,10 +100,7 @@ def pge_export():
         This represents the dollar amount pricing per export kWh.
     """
     df = pd.read_csv("data/pge-export.csv")
-    # keep only generation rates
-    df = df[df["RIN"].str.contains("USCA-XXPG")]
-    cols = ["DateStart", "TimeStart", "Value"]
-    df = df[cols]
+    df = df[["DateStart", "TimeStart", "Value", "RIN"]]
     df["DateTime"] = pd.to_datetime(df["DateStart"] + " " + df["TimeStart"])
     # convert DateTime from UTC to PST/PDT
     df["DateTime"] = (
@@ -76,12 +108,26 @@ def pge_export():
     )
     # drop timezone from DateTime
     df["DateTime"] = df["DateTime"].dt.tz_localize(None)
+
+    df_gen = df[df["RIN"].str.contains("USCA-XXPG")]
+    df_gen["generation credit"] = df_gen["Value"]
+    df_tnd = df[df["RIN"].str.contains("USCA-PGXX")]
+    df_tnd["delivery credit"] = df_tnd["Value"]
+
+    # merge on DateTime
+    df = pd.merge(
+        df_gen[["DateTime", "generation credit"]],
+        df_tnd[["DateTime", "delivery credit"]],
+        on="DateTime",
+    )
+    df = df[["DateTime", "generation credit", "delivery credit"]]
     filename = "data/pge-export-pt.csv"
-    df = df[["DateTime", "Value"]]
     df.to_csv(filename, index=False)
     print(f"wrote {filename}")
+    df["total credit"] = df["generation credit"] + df["delivery credit"]
     # get rows where Datetime.hour is 0
-    plt.plot(df["DateTime"], df["Value"])
+    plt.plot(df["DateTime"], df["generation credit"], label="generation credit")
+    plt.plot(df["DateTime"], df["delivery credit"], label="delivery credit")
     plt.title("PG&E Export Rates")
     plt.xlabel("Date")
     plt.ylabel("Value ($/kWh)")
@@ -91,8 +137,8 @@ def pge_export():
     plt.close()
     # create chart with a histogram of the Value column
     # set bins to 0.10, 0.20, 0.30, etc.
-    bins = np.arange(0, df["Value"].max() + 0.1, 0.1)
-    plt.hist(df["Value"], bins=bins)
+    bins = np.arange(0, df["total credit"].max() + 0.1, 0.1)
+    plt.hist(df["total credit"], bins=bins)
     plt.title("PG&E Export Rates")
     plt.xlabel("Value ($/kWh)")
     plt.ylabel("Count")
@@ -100,10 +146,10 @@ def pge_export():
     filename = "output/pge-export-histogram.png"
     plt.savefig(filename)
     plt.close()
-    over_off_peak = df[df["Value"] > 0.40]
+    over_off_peak = df[df["total credit"] > 0.40]
     fraction = len(over_off_peak) / len(df)
     print(f"Hours over off-peak rate: {fraction:.2%}")
-    over_base = df[df["Value"] > 0.03]
+    over_base = df[df["total credit"] > 0.03]
     fraction = len(over_base) / len(df)
     print(f"Hours over 0.03 {fraction:.2%}")
     return df
@@ -149,10 +195,19 @@ def add_ev(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def main():
-    # copy_charging()
-    pge_export()
+def main(op: str, tariff: str):
+    if op == "copy_charging":
+        copy_charging()
+    elif op == "arbitrage_targets":
+        daily_arbitrage_targets(tariff)
+    elif op == "pge_export":
+        pge_export()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("op", type=str)
+    parser.add_argument("--tariff", type=str, default="EV2-A", nargs="?")
+    args = parser.parse_args()
+
+    main(args.op, args.tariff)

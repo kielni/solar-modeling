@@ -11,4 +11,27 @@ COLORS = {
     "savings": "#018571",
     "part peak": "lightyellow",
     "peak": "lightcoral",
+    "delivery": "#1f78b4",
+    "delivery-light": "#a6cee3",
+    "generation": "#33a02c",
+    "generation-light": "#b2df8a",
+}
+
+RATE_VALUES = {
+    "ELEC": {
+        "winter off peak": 0.35,
+        "winter peak": 0.38,
+        "winter part peak": 0.36,
+        "summer off peak": 0.40,
+        "summer peak": 0.61,
+        "summer part peak": 0.45,
+    },
+    "EV2-A": {
+        "winter off peak": 0.31,
+        "winter peak": 0.48,
+        "winter part peak": 0.50,
+        "summer off peak": 0.31,
+        "summer peak": 0.62,
+        "summer part peak": 0.51,
+    },
 }
