@@ -2,6 +2,8 @@ import argparse
 import csv
 from datetime import date, datetime
 import os
+from typing import Any
+import calendar
 
 import gspread
 from gspread import Spreadsheet
@@ -15,7 +17,15 @@ import pandas as pd
 from pydantic import BaseModel, Field
 import yaml
 
-from util import COLORS, RATE_VALUES, Charges
+from util import (
+    COLORS,
+    RATE_VALUES,
+    Charges,
+    RATE_VALUES_MONTHLY,
+    RATE_VALUES_DAILY,
+    BONUS_CREDIT,
+    BONUS_END_YEAR,
+)
 
 # https://www.pge.com/assets/pge/docs/account/rate-plans/residential-electric-rate-plan-pricing.pdf
 # https://www.pge.com/tariffs/assets/pdf/tariffbook/ELEC_SCHEDS_E-ELEC.pdf
@@ -71,7 +81,6 @@ BASE_BATTERY_CAPACITY = 30
 # scale to parameter value
 BATTERY_CAPACITY = BASE_BATTERY_CAPACITY
 # max 10 kW per 15 kWh battery
-# TODO: super peak battery over two periods
 BATTERY_DISCHARGE_RATIO = 10 / 15
 
 # average peak usage
@@ -88,8 +97,6 @@ MIN_BATTERY_SUMMER = BASE_MIN_BATTERY_SUMMER
 ANNUAL_RATE_INCREASE = 0.04
 
 DEFAULT_USAGE = "data/charging.csv"
-
-FILL_OFF_PEAK = False
 
 OUTPUT_DIR = "output"
 
@@ -127,7 +134,6 @@ def set_params(config: dict):
     global OUTPUT_DIR
     global BATTERY_CAPACITY
     global SOLAR_CAPACITY
-    global FILL_OFF_PEAK
     global MIN_BATTERY_WINTER
     global MIN_BATTERY_SUMMER
     global ANNUAL_RATE_INCREASE
@@ -146,27 +152,28 @@ def set_params(config: dict):
     )
 
 
-def set_rates(df: pd.DataFrame, tariff: str, rates: dict[str, float]) -> pd.DataFrame:
+def set_rates(df: pd.DataFrame, tariff: str, rates: dict[str, Any]) -> pd.DataFrame:
     """Set rate per kWh from period and tariff"""
-    for period, charges in rates.items():
+    for period in rates:
+        charges = rates[period]
         df.loc[df["period"] == period, f"{tariff} generation"] = charges.generation
         df.loc[df["period"] == period, f"{tariff} delivery"] = charges.delivery
         df.loc[df["period"] == period, f"{tariff} other"] = charges.other
     df_export = load_export()
     # drop credits and replace with new values
-    if "generation credit" in df.columns:
-        df = df.drop(columns=["generation credit"])
-    if "delivery credit" in df.columns:
-        df = df.drop(columns=["delivery credit"])
+    for key in ["generation credit", "delivery credit", "bonus credit"]:
+        if key in df.columns:
+            df = df.drop(columns=[key])
     df = pd.merge(df, df_export, left_on="Timestamp", right_on="DateTime", how="left")
     # drop spring DST hour from PG&E sheet
     # drop row where demand is NaN
     df = df[df["demand"].notna()]
     df["generation credit"] = df["generation credit"].fillna(0.0)
     df["delivery credit"] = df["delivery credit"].fillna(0.0)
-    # ELEC has a service charge of $15 per billing period
-    # approximate hourly to make the calculations easier
-    df["service charge"] = (15 * 12) / (365 * 24)
+    # set bonus credit to BONUS_CREDIT through BONUS_END_YEAR
+    df["bonus credit"] = np.where(
+        df["Timestamp"].dt.year <= BONUS_END_YEAR, BONUS_CREDIT, 0.0
+    )
     return df
 
 
@@ -381,104 +388,6 @@ hours, to achieve the most economical use of electricity for Smart Circuits.
 """
 
 
-def perfect_arbitrage(
-    df: pd.DataFrame, hourly_output: dict[str, float], suffix: str = ""
-):
-    """
-    highest price is 7pm each day
-    fill the battery at 2pm if needed
-    do not use battery until max hour
-    at max hour, dump battery
-    """
-    #  initial battery level for the model
-    battery_level = BATTERY_CAPACITY / 2
-    max_export_hour = 19  # 7pm
-    rows = []
-    for _, row in df.iterrows():
-        flow = Flow(
-            timestamp=row["Timestamp"].to_pydatetime(),
-            # need this much
-            demand=row["demand"],
-            # available solar generation
-            solar_generation=hourly_output.get(
-                row["Timestamp"].strftime("%m-%d %H:%M"), 0.0
-            )
-            * row["solar_efficiency"],
-            start_battery_level=battery_level,
-        )
-        min_battery = min_battery_level(flow.timestamp.month)
-        period_type = row["period_type"]
-        demand = flow.demand
-        # from solar first
-        flow.from_solar = min(demand, flow.solar_generation)
-        demand -= flow.from_solar
-        hour = flow.timestamp.hour
-        # save battery to dump at max export hour
-        preserve_battery = 15 <= hour <= max_export_hour
-        if period_type in ["peak", "part peak"]:
-            # then from battery
-            if not preserve_battery:
-                flow.from_battery = min(demand, flow.start_battery_level)
-            demand -= flow.from_battery
-            if demand:
-                # then from grid
-                flow.from_grid = demand
-            else:
-                # to battery
-                excess = flow.solar_generation - flow.from_solar
-                flow.to_battery = min(
-                    BATTERY_CAPACITY - flow.start_battery_level, excess
-                )
-        else:  # off peak
-            # from battery if battery is high enough
-            if (
-                demand
-                and not preserve_battery
-                and flow.start_battery_level > min_battery
-            ):
-                flow.from_battery = min(demand, flow.start_battery_level - min_battery)
-                demand -= flow.from_battery
-            if demand:
-                flow.from_grid = demand
-            else:
-                # to battery
-                excess = flow.solar_generation - flow.from_solar
-                flow.to_battery = min(
-                    excess, BATTERY_CAPACITY - flow.start_battery_level
-                )
-            # if last off peak hour, fill battery
-            if flow.timestamp.hour == (FIRST_PEAK_HOUR - 1):
-                battery_level = flow.start_battery_level + flow.to_battery
-                charge = BATTERY_CAPACITY - battery_level
-                flow.to_battery += charge
-                flow.from_grid += charge
-        # to grid
-        if flow.timestamp.hour == max_export_hour:
-            # send all battery to grid at max export hour
-            battery_level = flow.start_battery_level + flow.to_battery
-            flow.to_grid = battery_level
-            flow.end_battery_level = 0
-        else:
-            flow.to_grid = max(
-                flow.solar_generation - flow.from_solar - flow.to_battery, 0
-            )
-            flow.end_battery_level = (
-                flow.start_battery_level - flow.from_battery + flow.to_battery
-            )
-
-        battery_level = flow.end_battery_level
-        # print(flow)
-        rows.append(flow.model_dump(mode="json"))
-    df_flows = pd.DataFrame(rows)
-    # add pd.Timestamp column to df_flows from timestamp
-    df_flows["Timestamp"] = pd.to_datetime(df_flows["timestamp"])
-    df = df.merge(df_flows, on="Timestamp", how="left")
-    filename = f"{get_output_dir()}/flows_v3{suffix}-arbitrage.csv"
-    df.to_csv(f"{filename}", index=False)
-    print(f"wrote flows to {filename}")
-    return df
-
-
 def apply_flow(flow: Flow, period_type: str) -> Flow:
     demand = flow.demand
     min_battery = min_battery_level(flow.timestamp.month)
@@ -517,13 +426,15 @@ def apply_flow(flow: Flow, period_type: str) -> Flow:
 
 
 def apply_arbitrage(flow: Flow, period_type: str, df_arbitrage: pd.DataFrame) -> Flow:
+    # might be up to two targets per day
     target = df_arbitrage[df_arbitrage["DateTime"] == pd.Timestamp(flow.timestamp)]
     if target.empty:
         return apply_flow(flow, period_type)
+    rows = df_arbitrage[df_arbitrage["DateTime"].dt.date == flow.timestamp.date()]
     target_row = target.iloc[0]
     target_hour = target_row["DateTime"].hour
     # arbitrage passed; back to flow model
-    if flow.timestamp.hour > target_hour:
+    if flow.timestamp.hour > rows["DateTime"].max().hour:
         return apply_flow(flow, period_type)
 
     # on a day with an arbitrage opportunity
@@ -542,8 +453,19 @@ def apply_arbitrage(flow: Flow, period_type: str, df_arbitrage: pd.DataFrame) ->
         flow.from_grid = demand
     # if it's the arbitrage hour, dump the battery to grid
     if flow.timestamp.hour == target_hour:
-        flow.to_grid = flow.start_battery_level + flow.to_battery
-        flow.end_battery_level = 0
+        battery_level = flow.start_battery_level + flow.to_battery
+        max_discharge = rows["target discharge"].max()
+        discharge = min(battery_level, max_discharge)
+        if target_row["target discharge"] < max_discharge:
+            # if this is not the best discharge error
+            # limit discharge to save for the next hour
+            discharge = max(battery_level - max_discharge, 0)
+        print(
+            f"arbitrage: {flow.timestamp}\tbattery\t{battery_level:.1f}"
+            f"\tdischarge\t{discharge:.1f}\t{target_row["total credit"]:.1f}"
+        )
+        flow.to_grid = discharge
+        flow.end_battery_level = battery_level - discharge
     else:
         # else just the excess
         flow.to_grid = flow.solar_generation - flow.from_solar - flow.to_battery
@@ -864,9 +786,9 @@ def write_to_sheet(df: pd.DataFrame, sheet_name: str):
     # use gspread to write to Google Sheet
     print("writing to Google Sheet")
     """
-    ['Timestamp', 'kW', 'month', 'hour', 'yyyymm', 'ymd', 'season', 'period', 'period_type', 'timestamp', 
-    'demand', 'start_battery_level', 'end_battery_level', 'solar_generation', 'from_solar', 'from_battery', 'from_grid', 'to_battery', 'to_grid', 
-    'ELEC', 'generation credit', 'delivery credit', 'service charge', 'pge cost ELEC', 'pge credit', 'grid cost ELEC', 'net cost ELEC', 'savings ELEC', 
+    ['Timestamp', 'kW', 'month', 'hour', 'yyyymm', 'ymd', 'season', 'period', 'period_type', 'timestamp',
+    'demand', 'start_battery_level', 'end_battery_level', 'solar_generation', 'from_solar', 'from_battery', 'from_grid', 'to_battery', 'to_grid',
+    'ELEC', 'generation credit', 'delivery credit', 'bonus credit', 'pge cost ELEC', 'pge credit', 'grid cost ELEC', 'net cost ELEC', 'savings ELEC',
     'EV2-A', 'pge cost EV2-A', 'grid cost EV2-A', 'net cost EV2-A', 'savings EV2-A']
     """
     cols = [
@@ -885,12 +807,13 @@ def write_to_sheet(df: pd.DataFrame, sheet_name: str):
         "to_grid",
         "generation credit",
         "delivery credit",
+        "bonus credit",
         "ELEC generation cost",
         "ELEC generation credit",
         "ELEC delivery cost",
         "ELEC delivery credit",
+        # includes service charge
         "ELEC other cost",
-        "ELEC service charge",
         "ELEC grid cost",
     ]
     """
@@ -899,7 +822,6 @@ def write_to_sheet(df: pd.DataFrame, sheet_name: str):
         "EV2-A generation credit",
         "EV2-A delivery cost",
         "EV2-A delivery credit",
-        "EV2-A service charge",
         "EV2-A grid cost",
 
     """
@@ -936,13 +858,9 @@ def add_costs(
             df[f"{tariff} {key} cost"] = df["from_grid"] * df[f"{tariff} {key}"]
             df[f"{tariff} {key} credit"] = df["to_grid"] * df[f"{key} credit"]
             df[f"{tariff} grid cost"] += df["demand"] * df[f"{tariff} {key}"]
-        df[f"{tariff} other cost"] = df["to_grid"] * df[f"{tariff} other"]
+        df[f"{tariff} bonus credit"] = df["to_grid"] * df["bonus credit"]
+        df[f"{tariff} other cost"] = df["from_grid"] * df[f"{tariff} other"]
         df[f"{tariff} grid cost"] += df["demand"] * df[f"{tariff} other"]
-        if tariff == "ELEC":
-            df[f"{tariff} service charge"] = df["service charge"]
-            df[f"{tariff} grid cost"] += df["service charge"]
-        else:
-            df[f"{tariff} service charge"] = 0.0
         # apply credits monthly; cost does not go negative but credits rollover
     cols = [
         "Timestamp",
@@ -964,12 +882,13 @@ def add_costs(
         "ELEC other",
         "generation credit",
         "delivery credit",
+        "bonus credit",
         "ELEC generation cost",
         "ELEC generation credit",
         "ELEC delivery cost",
         "ELEC delivery credit",
+        "ELEC bonus credit",
         "ELEC other cost",
-        "ELEC service charge",
         "ELEC grid cost",
     ] + date_helpers()
     """
@@ -978,7 +897,6 @@ def add_costs(
         "EV2-A generation credit",
         "EV2-A delivery cost",
         "EV2-A delivery credit",
-        "EV2-A service charge",
         "EV2-A grid cost",
     """
     df = df[cols]
@@ -1073,7 +991,7 @@ def print_summary(
     lines.append("\n")
     lines.append(
         "\ntariff\tPG&E\tnet cost\tsavings\t"
-        "delivery credit rollover\tgeneration credit rollover\t"
+        "delivery credit rollover\tgeneration credit rollover\tbonus credit rollover\t"
         "used credit per exported kWh"
     )
     row = {"scenario": f"{config['description']}"}
@@ -1087,10 +1005,12 @@ def print_summary(
         last_row = df_monthly.iloc[-1]
         delivery_rollover = last_row["delivery rollover credit"]
         generation_rollover = last_row["generation rollover credit"]
+        bonus_rollover = last_row["bonus rollover credit"]
         # credit used; excludes rollover
         credit_per_kwh = (
             df_monthly["delivery credit applied"].sum()
             + df_monthly["generation credit applied"].sum()
+            + df_monthly["bonus credit applied"].sum()
         ) / df_monthly["to_grid"].sum()
         savings = grid_cost - net_cost
         row.update(
@@ -1104,8 +1024,12 @@ def print_summary(
                 f"{tariff} applied delivery credit": df_monthly[
                     "delivery credit applied"
                 ].sum(),
+                f"{tariff} applied bonus credit": df_monthly[
+                    "bonus credit applied"
+                ].sum(),
                 f"{tariff} delivery rollover credit": delivery_rollover,
                 f"{tariff} generation rollover credit": generation_rollover,
+                f"{tariff} bonus rollover credit": bonus_rollover,
                 f"{tariff} credit per kWh": credit_per_kwh,
             }
         )
@@ -1122,13 +1046,16 @@ def print_summary(
                     "generation credit applied"
                 ].sum(),
                 "applied delivery credit": df_monthly["delivery credit applied"].sum(),
+                "applied bonus credit": df_monthly["bonus credit applied"].sum(),
                 "delivery rollover credit": delivery_rollover,
                 "generation rollover credit": generation_rollover,
+                "bonus rollover credit": bonus_rollover,
                 "credit per kWh": credit_per_kwh,
             }
         lines.append(
             f"{tariff}\t${grid_cost:,.0f}\t${net_cost:,.0f}\t${savings:,.0f}\t"
             f"${delivery_rollover:,.0f}\t${generation_rollover:,.0f}\t"
+            f"${bonus_rollover:,.0f}\t"
             f"${credit_per_kwh:,.2f}"
         )
     lines.append("\n")
@@ -1149,6 +1076,8 @@ def print_summary(
     lines.append(
         f"delivery rollover credit: ${annual['delivery rollover credit']:,.0f}"
     )
+    lines.append(f"applied bonus credit: ${annual['applied bonus credit']:,.0f}")
+    lines.append(f"bonus rollover credit: ${annual['bonus rollover credit']:,.0f}")
     lines.append(f"credit per kWh: ${annual['credit per kWh']:,.2f}")
     lines.append("\n")
     lines.append(f"payback period\t{payback_period:.1f} years")
@@ -1177,8 +1106,10 @@ def print_summary(
         "savings",
         "applied generation credit",
         "applied delivery credit",
+        "applied bonus credit",
         "delivery rollover credit",
         "generation rollover credit",
+        "bonus rollover credit",
         "credit per kWh",
         "demand",
         "solar",
@@ -1241,7 +1172,7 @@ def chart_daily(df: pd.DataFrame, month: date):
     ax.plot(
         df_daily["day"],
         df_daily["start_battery_level"],
-        label=f"battery level",
+        label="battery level",
         color=COLORS["battery_level"],
         linewidth=2,
     )
@@ -1303,15 +1234,17 @@ def label_from_params():
     return LABEL
 
 
-def cost_chart_setup(ax, months: list[str]):
-    x = np.arange(0, 12)
+def cost_chart_setup(ax):
+    x = np.arange(1, 13)
     ax.set_xticks(x)
+    months = [date(2025, month, 1).strftime("%b") for month in x]
     ax.set_xticklabels(months)
     ax.legend()
     # add grid lines
     ax.grid(axis="y", color="lightgray", alpha=0.7)
     ax.set_axisbelow(True)
-    ax.set_xlim(-0.5, 11.5)
+    ax.set_xlim(0.5, 12.5)
+    ax.axhline(0, color="black", linewidth=1)
     ax.yaxis.set_major_formatter(mtick.FuncFormatter(lambda x, p: f"${int(x):,}"))
 
 
@@ -1320,10 +1253,18 @@ def calculate_monthly_costs(
     tariff: str,
     generation_credit: float = 0.0,
     delivery_credit: float = 0.0,
+    bonus_credit: float = 0.0,
 ) -> pd.DataFrame:
     # group by month and sum costs by tariff
-    rollover = {"generation": generation_credit, "delivery": delivery_credit}
+    rollover = {
+        "generation": generation_credit,
+        "delivery": delivery_credit,
+        "bonus": bonus_credit,
+        # no rollover tracking but makes code simpler
+        "other": 0.0,
+    }
     df = df.sort_values(by="Timestamp")
+    year = df["Timestamp"].dt.year.max()
     df_monthly = (
         df.groupby("month")
         .agg(
@@ -1332,7 +1273,7 @@ def calculate_monthly_costs(
                 f"{tariff} generation credit": "sum",
                 f"{tariff} delivery cost": "sum",
                 f"{tariff} delivery credit": "sum",
-                f"{tariff} service charge": "sum",
+                f"{tariff} bonus credit": "sum",
                 f"{tariff} other cost": "sum",
                 f"{tariff} grid cost": "sum",
                 "to_grid": "sum",
@@ -1342,29 +1283,162 @@ def calculate_monthly_costs(
         .sort_values(by="month")
     )
 
+    service_charge = RATE_VALUES_MONTHLY.get(tariff, {}).get("service charge", 0.0)
+    df_monthly["bonus credit applied"] = 0.0
     for idx, row in df_monthly.iterrows():
         total = 0.0
         grid_cost = 0.0
+        # get number of days in this month
+        days = calendar.monthrange(year, int(row["month"]))[1]
+        # can't offset this
+        delivery_minimum = (
+            RATE_VALUES_DAILY.get(tariff, {}).get("delivery minimum", 0.0) * days
+        )
+        credit_used: dict[str, float] = {
+            "generation": 0.0,
+            "delivery": 0.0,
+            "other": 0.0,
+            "bonus": 0.0,
+        }
         for key in ["generation", "delivery", "other"]:
             cost_key = f"{tariff} {key} cost"
             cost = row[cost_key]
-            grid_cost += cost
-            if key == "other":
-                credit = 0.0
-            else:
+            if key != "other":
                 credit_key = f"{tariff} {key} credit"
-                credit = row[credit_key] + rollover[key]
-            net = max(cost - credit, 0.0)
-            credit_used = cost - net
-            rollover[key] = credit - credit_used
+                credit_available = row[credit_key] + rollover[key]
+            grid_cost += cost
+            net = max(cost - credit_available, 0.0)
+            if key == "delivery" and net < delivery_minimum:
+                net = delivery_minimum
+            credit_used[key] = max(cost - net, 0)
+            rollover[key] = credit_available - credit_used[key]
+            # use bonus credit for generation or delivery (electricity cost)
+            credit_used["bonus"] = 0.0
+            credit_available = float(row[f"{tariff} bonus credit"] + rollover["bonus"])
+            if credit_available and net > 0.0:
+                if key == "generation":
+                    credit_used["bonus"] = min(credit_available, net)
+                if key == "delivery" and net > delivery_minimum:
+                    credit_used["bonus"] = min(credit_available, net - delivery_minimum)
+            net -= credit_used["bonus"]
+            rollover["bonus"] = credit_available - credit_used["bonus"]
             total += net
             df_monthly.at[idx, f"{key} net cost"] = net
-            df_monthly.at[idx, f"{key} credit applied"] = credit_used
+            df_monthly.at[idx, f"{key} credit applied"] = credit_used[key]
             df_monthly.at[idx, f"{key} rollover credit"] = rollover[key]
-        df_monthly.at[idx, "net cost"] = total + row[f"{tariff} service charge"]
-    service_charge = df_monthly[f"{tariff} service charge"].sum()
-    df_monthly["grid cost"] = df_monthly[f"{tariff} grid cost"] + service_charge
+            df_monthly.at[idx, "bonus credit applied"] += credit_used["bonus"]
+            df_monthly.at[idx, "bonus rollover credit"] = rollover["bonus"]
+        df_monthly.at[idx, "net cost"] = total + service_charge
+        df_monthly.at[idx, f"{tariff} other cost"] += service_charge
+    df_monthly["grid cost"] = df_monthly[f"{tariff} grid cost"]
     return df_monthly
+
+
+def chart_credits(df_monthly: pd.DataFrame, tariff: str, year: int = 1):
+    # credits
+    fig, ax = plt.subplots(figsize=(12, 6))
+    gen_used = df_monthly["generation credit applied"]
+    gen_created = df_monthly[f"{tariff} generation credit"]
+    bonus_used = df_monthly["bonus credit applied"]
+    bonus_created = df_monthly[f"{tariff} bonus credit"]
+    delivery_used = df_monthly["delivery credit applied"]
+    delivery_created = df_monthly[f"{tariff} delivery credit"]
+    df_monthly["credits used"] = gen_used + delivery_used + bonus_used
+    df_monthly["credits created"] = gen_created + delivery_created + bonus_created
+    # credit applied: below the axis since it's a bill credit
+    ax.bar(
+        df_monthly["month"],
+        -delivery_used,
+        color=COLORS["delivery"],
+        label="delivery credit applied",
+    )
+    ax.bar(
+        df_monthly["month"],
+        -gen_used,
+        color=COLORS["generation"],
+        bottom=-delivery_used,
+        label="generation credit applied",
+    )
+    ax.bar(
+        df_monthly["month"],
+        -bonus_used,
+        color=COLORS["bonus"],
+        bottom=-(delivery_used + gen_used),
+        label="bonus credit applied",
+    )
+    # credit generation: positive
+    ax.bar(
+        df_monthly["month"],
+        delivery_created,
+        color=COLORS["delivery"],
+        label="delivery export credit",
+        alpha=0.6,
+    )
+    ax.bar(
+        df_monthly["month"],
+        gen_created,
+        bottom=delivery_created,
+        color=COLORS["generation"],
+        label="generation export credit",
+        alpha=0.6,
+    )
+    ax.bar(
+        df_monthly["month"],
+        bonus_created,
+        color=COLORS["bonus"],
+        bottom=(delivery_created + gen_created),
+        label="bonus export credit",
+        alpha=0.6,
+    )
+    total_credit = df_monthly["credits used"].sum()
+    df_monthly["credit per kWh"] = df_monthly["credits created"] / df_monthly["to_grid"]
+    df_monthly["credit per kWh"] = df_monthly["credit per kWh"].fillna(0.0)
+    ax.set_title(f"{label_from_params()} export credit: year {year}")
+    last_row = df_monthly.iloc[-1]
+    gen_credit = round(last_row["generation rollover credit"])
+    delivery_credit = round(last_row["delivery rollover credit"])
+    bonus_credit = round(last_row["bonus rollover credit"])
+    text = (
+        f"${total_credit:,.0f} credits applied\n"
+        f"${gen_credit:,.0f} generation rollover credit\n"
+        f"${delivery_credit:,.0f} delivery rollover credit\n"
+        f"${bonus_credit:,.0f} bonus rollover credit\n"
+    )
+    plt.text(
+        0.15,  # x-coordinate
+        0.9,  # y-coordinate
+        text,
+        ha="center",
+        va="top",
+        transform=plt.gca().transAxes,
+        fontsize=12,
+        color="black",
+    )
+    ax.set_ylabel("credit $")
+    y_min = -df_monthly["credits used"].max()
+    y_max = df_monthly["credits created"].max()
+    ax.set_ylim(y_min * 1.1, y_max * 1.2)
+    cost_chart_setup(ax)
+    ax.legend()
+    # add value of df_monthly["to_grid"] for each bar
+    for _, row in df_monthly.iterrows():
+        text = (
+            f"{row['to_grid']:.0f} kWh\n"  # export kWh
+            f"{row['credit per kWh']:.2f}/kWh"  # credit per kWh
+        )
+        plt.text(
+            row["month"],
+            row["credits created"],
+            text,
+            fontsize=9,
+            ha="center",
+            va="bottom",
+        )
+    plt.tight_layout()
+    filename = f"{get_output_dir()}/credits_{year:02d}.png"
+    fig.savefig(filename, dpi=300, bbox_inches="tight")
+    print(f"wrote credits to {filename}")
+    plt.close(fig)
 
 
 def chart_costs(df_monthly: pd.DataFrame, tariff: str, year: int = 1):
@@ -1372,34 +1446,20 @@ def chart_costs(df_monthly: pd.DataFrame, tariff: str, year: int = 1):
 
     Add total savings for the year as a text box.
     """
-    months = [date(2025, month, 1).strftime("%b") for month in df_monthly["month"]]
-    x = np.arange(len(months))
-    width = 0.35
     fig, ax = plt.subplots(figsize=(12, 6))
-    ax.bar(
-        x - width / 2,
-        df_monthly[f"{tariff} grid cost"],
-        width,
-        label="PG&E",
-        color=COLORS["vs"],
-    )
-    other_cost = (
-        df_monthly[f"{tariff} other cost"] + df_monthly[f"{tariff} service charge"]
-    )
+    other_cost = df_monthly[f"{tariff} other cost"]
     cost = round(other_cost.sum())
     ax.bar(
-        x + width / 2,
+        df_monthly["month"],
         other_cost,
-        width,
         label=f"solar + battery other ${cost:,.0f}",
         color=COLORS["other"],
     )
     delivery_cost = df_monthly["delivery net cost"]
     cost = round(delivery_cost.sum())
     ax.bar(
-        x + width / 2,
+        df_monthly["month"],
         delivery_cost,
-        width,
         bottom=other_cost,
         label=f"solar + battery delivery ${cost:,.0f}",
         color=COLORS["delivery"],
@@ -1407,29 +1467,33 @@ def chart_costs(df_monthly: pd.DataFrame, tariff: str, year: int = 1):
     generation_cost = df_monthly["generation net cost"]
     cost = round(generation_cost.sum())
     ax.bar(
-        x + width / 2,
+        df_monthly["month"],
         generation_cost,
-        width,
         bottom=delivery_cost + other_cost,
         label=f"solar + battery generation ${cost:,.0f}",
         color=COLORS["generation"],
     )
-    credit = round(
-        df_monthly["delivery credit applied"].sum()
-        + df_monthly["generation credit applied"].sum()
+    credit = (
+        df_monthly["delivery credit applied"]
+        + df_monthly["generation credit applied"]
+        + df_monthly["bonus credit applied"]
     )
+    credit_applied = round(credit.sum())
     ax.plot(
-        x,
-        df_monthly["delivery credit applied"] + df_monthly["generation credit applied"],
-        label=f"export credit applied ${credit:,.0f}",
+        df_monthly["month"],
+        credit,
+        label=f"export credit applied ${credit_applied:,.0f}",
         color=COLORS["from_grid"],
+        # dotted line
+        linestyle="--",
     )
-    cost_chart_setup(ax, months)
+    cost_chart_setup(ax)
     ax.set_ylabel("cost $")
     grid_cost = round(df_monthly[f"{tariff} grid cost"].sum())
     solar_cost = round(df_monthly["net cost"].sum())
     delivery_credit = round(df_monthly.iloc[11]["delivery rollover credit"])
     generation_credit = round(df_monthly.iloc[11]["generation rollover credit"])
+    bonus_credit = round(df_monthly.iloc[11]["bonus rollover credit"])
     savings_pct = round(solar_cost / grid_cost * 100)
     total_savings = grid_cost - solar_cost
     # group by month, sum net cost {tariff}
@@ -1440,9 +1504,12 @@ def chart_costs(df_monthly: pd.DataFrame, tariff: str, year: int = 1):
         f"${total_savings:,.0f} annual savings\n"
         f"${monthly_bill:,.0f} average monthly bill\n"
         f"{savings_pct}% of PG&E cost\n"
-        f"${delivery_credit:,.0f} delivery rollover credit\n"
         f"${generation_credit:,.0f} generation rollover credit\n"
     )
+    if delivery_credit:
+        text += f"${delivery_credit:,.0f} delivery rollover credit\n"
+    if bonus_credit:
+        text += f"${bonus_credit:,.0f} bonus rollover credit\n"
     plt.text(
         0.85,
         0.95,
@@ -1457,105 +1524,6 @@ def chart_costs(df_monthly: pd.DataFrame, tariff: str, year: int = 1):
     filename = f"{get_output_dir()}/costs_{year:02d}.png"
     fig.savefig(filename, dpi=300, bbox_inches="tight")
     print(f"wrote costs to {filename}")
-    plt.close(fig)
-
-    # credits
-    fig, ax = plt.subplots(figsize=(12, 6))
-    gen_used = df_monthly[f"{tariff} delivery credit"]
-    gen_created = df_monthly[f"{tariff} generation credit"]
-    delivery_used = df_monthly[f"{tariff} delivery credit"]
-    delivery_created = df_monthly["delivery credit applied"]
-    df_monthly["credits used"] = gen_used + delivery_used
-    df_monthly["credits created"] = gen_created + delivery_created
-    # want to see:
-    """
-    from bottom to top, dark color
-    delivery credit applied
-    generation credit applied
-
-    below x axis: light color
-    delivery export credit
-    generation export credit
-    """
-    ax.bar(
-        df_monthly["month"],
-        delivery_used,
-        color=COLORS["delivery"],
-        label="delivery credit applied",
-    )
-    ax.bar(
-        df_monthly["month"],
-        gen_used,
-        color=COLORS["generation"],
-        bottom=delivery_used,
-        label="generation credit applied",
-    )
-
-    ax.bar(
-        df_monthly["month"],
-        -delivery_created,
-        color=COLORS["delivery-light"],
-        label=f"delivery export credit",
-    )
-
-    ax.bar(
-        df_monthly["month"],
-        -gen_created,
-        bottom=-delivery_created,
-        color=COLORS["generation-light"],
-        label="generation export credit",
-        linestyle="--",
-    )
-
-    total_credit = df_monthly["credits used"].sum()
-    df_monthly["credit per kWh"] = df_monthly["credits created"] / df_monthly["to_grid"]
-    df_monthly["credit per kWh"] = df_monthly["credit per kWh"].fillna(0.0)
-    ax.set_title(f"{label_from_params()} export credit: year {year}")
-    last_row = df_monthly.iloc[-1]
-    gen_credit = round(last_row["generation rollover credit"])
-    delivery_credit = round(last_row["delivery rollover credit"])
-    # rollover credit is the
-    text = (
-        f"${total_credit:,.0f} credits applied\n"
-        f"${gen_credit:,.0f} generation rollover credit\n"
-        f"${delivery_credit:,.0f} delivery rollover credit\n"
-    )
-    plt.text(
-        0.15,  # x-coordinate
-        0.15,  # y-coordinate
-        text,
-        ha="center",
-        va="top",
-        transform=plt.gca().transAxes,
-        fontsize=12,
-        color="black",
-    )
-    ax.set_ylabel("credit $")
-    y_max = df_monthly["credits used"].max()
-    y_min = -df_monthly["credits created"].max()
-    ax.set_ylim(y_min, y_max + 300)
-    cost_chart_setup(ax, months)
-    ax.axhline(0, color="black", linewidth=1)
-    ax.legend()
-    # add value of df_monthly["to_grid"] as text above each bar
-    for _, row in df_monthly.iterrows():
-        plt.text(
-            row["month"],
-            row["credits used"],
-            (
-                # export kWh
-                f"{row['to_grid']:.0f} kWh\n"
-                # credit per kWh
-                f"{row['credit per kWh']:.2f}/kWh"
-            ),
-            fontsize=10,
-            ha="center",
-            va="bottom",
-        )
-    plt.tight_layout()
-    filename = f"{get_output_dir()}/credits_{year:02d}.png"
-    fig.savefig(filename, dpi=300, bbox_inches="tight")
-    print(f"wrote credits to {filename}")
     plt.close(fig)
 
 
@@ -1622,6 +1590,7 @@ def calculate_roi(df: pd.DataFrame, df_arbitrage: pd.DataFrame, config: dict):
     tariff = FORECAST_TARIFF
     rollover_generation = 0.0
     rollover_delivery = 0.0
+    rollover_bonus = 0.0
     for year in range(years):
         if year > 0:
             # reduce the solar generation by the degradation factor
@@ -1641,6 +1610,8 @@ def calculate_roi(df: pd.DataFrame, df_arbitrage: pd.DataFrame, config: dict):
         print(
             f"year {year} solar efficiency: {solar_efficiency} off peak rate: {rates[FORECAST_TARIFF]['winter off peak']}"
         )
+        if year == 3:
+            print("check on year 3 credits")
         df_year = df.copy()
         df_year["Timestamp"] = df["Timestamp"] + pd.Timedelta(days=365 * year)
         df_year["solar_efficiency"] = solar_efficiency
@@ -1657,11 +1628,14 @@ def calculate_roi(df: pd.DataFrame, df_arbitrage: pd.DataFrame, config: dict):
             tariff,
             rollover_generation,
             rollover_delivery,
+            rollover_bonus,
         )
         chart_costs(df_year, FORECAST_TARIFF, year + 1)
+        chart_credits(df_year, FORECAST_TARIFF, year + 1)
         row = df_year.iloc[-1]
         rollover_generation = row["generation rollover credit"]
         rollover_delivery = row["delivery rollover credit"]
+        rollover_bonus = row["bonus rollover credit"]
         print(
             f"{year}: generation rollover credit ${rollover_generation:,.0f}\tdelivery rollover credit ${rollover_delivery:,.0f}"
         )
@@ -1674,7 +1648,7 @@ def calculate_roi(df: pd.DataFrame, df_arbitrage: pd.DataFrame, config: dict):
 
     df_years["savings"] = df_years["grid cost"] - df_years["net cost"]
     df_years["cumulative savings"] = (
-        df_years[f"savings"].cumsum() - config["system_cost"]
+        df_years["savings"].cumsum() - config["system_cost"]
     )
     df_years["cumulative pge"] = df_years[f"{tariff} grid cost"].cumsum()
     df_years["cumulative net"] = df_years["net cost"].cumsum()
@@ -1684,7 +1658,7 @@ def calculate_roi(df: pd.DataFrame, df_arbitrage: pd.DataFrame, config: dict):
     min_timestamp = df["Timestamp"].min().date()
     years = (payback_dt - min_timestamp).days / 365
     print(f"payback period: {payback_dt} ({years:.1f} years)")
-    irr = numpy_financial.irr([-config["system_cost"]] + df_years[f"savings"].to_list())
+    irr = numpy_financial.irr([-config["system_cost"]] + df_years["savings"].to_list())
     print(f"IRR: {irr:.2%}")
     cols = [
         "month",
@@ -1696,6 +1670,8 @@ def calculate_roi(df: pd.DataFrame, df_arbitrage: pd.DataFrame, config: dict):
         "delivery net cost",
         "delivery credit applied",
         "delivery rollover credit",
+        "bonus credit applied",
+        "bonus rollover credit",
         "grid cost",
         "net cost",
         "savings",
@@ -1709,24 +1685,30 @@ def calculate_roi(df: pd.DataFrame, df_arbitrage: pd.DataFrame, config: dict):
 
 
 def load_arbitrage_targets():
-    return pd.read_csv("data/arbitrage_targets.csv", parse_dates=["DateTime"])
+    max_discharge = BATTERY_CAPACITY * BATTERY_DISCHARGE_RATIO
+    remainder_discharge = BATTERY_CAPACITY - max_discharge
+    df = pd.read_csv("data/arbitrage_targets.csv", parse_dates=["DateTime"])
+    # sort by total_credit descending then by DateTime ascending
+    df = df.sort_values(by=["total credit", "DateTime"], ascending=[False, True])
+    df["target discharge"] = remainder_discharge
+    # group by date and iterate over each group
+    for dt, group in df.groupby(df["DateTime"].dt.date):
+        row = group.iloc[0]
+        df.loc[df["DateTime"] == row["DateTime"], "target discharge"] = max_discharge
+    return df
 
 
 def calculate_tariff_monthly_costs(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     monthly_costs: dict[str, pd.DataFrame] = {}
-    initial_generation_credit = 0.0
-    initial_delivery_credit = 0.0
     for tariff in RATE_VALUES.keys():
-        df_monthly = calculate_monthly_costs(
-            df, tariff, initial_generation_credit, initial_delivery_credit
-        )
+        df_monthly = calculate_monthly_costs(df, tariff)
         cols = [
             "month",
             f"{tariff} generation cost",
             f"{tariff} generation credit",
             f"{tariff} delivery cost",
             f"{tariff} delivery credit",
-            f"{tariff} service charge",
+            f"{tariff} bonus credit",
             f"{tariff} other cost",
             f"{tariff} grid cost",
             "to_grid",
@@ -1736,6 +1718,8 @@ def calculate_tariff_monthly_costs(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
             "delivery net cost",
             "delivery credit applied",
             "delivery rollover credit",
+            "bonus credit applied",
+            "bonus rollover credit",
             "net cost",
             "grid cost",
         ]
@@ -1773,6 +1757,7 @@ def main(config: dict):
     monthly_costs = calculate_tariff_monthly_costs(df)
     df_monthly = monthly_costs[FORECAST_TARIFF]
     chart_costs(df_monthly, FORECAST_TARIFF)
+    chart_credits(df_monthly, FORECAST_TARIFF)
 
     df_roi, payback_period, irr = calculate_roi(df_initial, df_arbitrage, config)
     chart_roi(df_roi, payback_period, irr)
@@ -1799,7 +1784,7 @@ def load_config(filename: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "config", type=str, default="solar-8-battery-30-arbitrage.yml", nargs="?"
+        "config", type=str, default="solar-10-battery-30.yml", nargs="?"
     )
     args = parser.parse_args()
     _config = load_config(args.config)

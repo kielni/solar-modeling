@@ -14,9 +14,13 @@ def daily_arbitrage_targets(tariff: str) -> pd.DataFrame:
     df["total credit"] = df["generation credit"] + df["delivery credit"]
     print(f"{len(df)} total hours")
     # first drop everything below off peak
-    df = df[df["total credit"] > 0.31]
+    df = df[df["total credit"] > 0.40]
     print(f"{len(df)} credit above off peak")
-    df = df.loc[df.groupby("date")["total credit"].idxmax()]
+    df = df.loc[
+        df.groupby("date")["total credit"]
+        .apply(lambda x: x.nlargest(2).index)
+        .explode()
+    ]
     df["month"] = pd.to_datetime(df["DateTime"]).dt.month
     df["date"] = pd.to_datetime(df["DateTime"]).dt.date
     df["hour"] = pd.to_datetime(df["DateTime"]).dt.hour
@@ -24,8 +28,8 @@ def daily_arbitrage_targets(tariff: str) -> pd.DataFrame:
     # set season to summer if month is between 6 and 9 else winter
     df["season"] = "winter"
     df.loc[df["month"].between(6, 9), "season"] = "summer"
-    winter_max = RATE_VALUES[tariff]["winter peak"]
-    summer_max = RATE_VALUES[tariff]["summer peak"]
+    winter_max = RATE_VALUES[tariff]["winter peak"].total()
+    summer_max = RATE_VALUES[tariff]["summer peak"].total()
     # set target to max rate for the season
     df["target"] = winter_max
     df.loc[df["season"] == "summer", "target"] = summer_max
@@ -37,6 +41,26 @@ def daily_arbitrage_targets(tariff: str) -> pd.DataFrame:
     print(f"writing arbitrage targets to {filename}")
     df.to_csv(filename, index=False)
     df = df[["DateTime", "date", "hour"]]
+    return df
+
+
+def copy_charging_orig(df: pd.DataFrame, from_month: date, to_month: date) -> pd.DataFrame:
+    """Copy usage from 0-3 from from_month to to_month"""
+    end = from_month + relativedelta(months=1)
+    from_dt = from_month
+    to_dt = to_month
+    while from_dt < end:
+        for hour in range(0, 4):
+            from_ts = pd.Timestamp(from_dt.year, from_dt.month, from_dt.day, hour)
+            to_ts = pd.Timestamp(to_dt.year, to_dt.month, to_dt.day, hour)
+            print(
+                f"from {from_ts} to {to_ts}: {df.loc[df['Timestamp'] == from_ts, 'kW'].values[0]}"
+            )
+            df.loc[df["Timestamp"] == to_ts, "kW ev"] = df.loc[
+                df["Timestamp"] == from_ts, "kW"
+            ].values[0]
+        from_dt += timedelta(days=1)
+        to_dt += timedelta(days=1)
     return df
 
 
@@ -155,26 +179,6 @@ def pge_export():
     return df
 
 
-def copy_charging(df: pd.DataFrame, from_month: date, to_month: date) -> pd.DataFrame:
-    """Copy usage from 0-3 from from_month to to_month"""
-    end = from_month + relativedelta(months=1)
-    from_dt = from_month
-    to_dt = to_month
-    while from_dt < end:
-        for hour in range(0, 4):
-            from_ts = pd.Timestamp(from_dt.year, from_dt.month, from_dt.day, hour)
-            to_ts = pd.Timestamp(to_dt.year, to_dt.month, to_dt.day, hour)
-            print(
-                f"from {from_ts} to {to_ts}: {df.loc[df['Timestamp'] == from_ts, 'kW'].values[0]}"
-            )
-            df.loc[df["Timestamp"] == to_ts, "kW ev"] = df.loc[
-                df["Timestamp"] == from_ts, "kW"
-            ].values[0]
-        from_dt += timedelta(days=1)
-        to_dt += timedelta(days=1)
-    return df
-
-
 def add_ev(df: pd.DataFrame) -> pd.DataFrame:
     """Charging starts 2025-04-01. Copy charging from 2025-04+ backwards.
 
@@ -207,7 +211,7 @@ def main(op: str, tariff: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("op", type=str)
-    parser.add_argument("--tariff", type=str, default="EV2-A", nargs="?")
+    parser.add_argument("--tariff", type=str, default="ELEC", nargs="?")
     args = parser.parse_args()
 
     main(args.op, args.tariff)
