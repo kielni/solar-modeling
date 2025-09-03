@@ -44,7 +44,9 @@ def daily_arbitrage_targets(tariff: str) -> pd.DataFrame:
     return df
 
 
-def copy_charging_orig(df: pd.DataFrame, from_month: date, to_month: date) -> pd.DataFrame:
+def copy_charging_orig(
+    df: pd.DataFrame, from_month: date, to_month: date
+) -> pd.DataFrame:
     """Copy usage from 0-3 from from_month to to_month"""
     end = from_month + relativedelta(months=1)
     from_dt = from_month

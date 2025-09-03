@@ -68,6 +68,8 @@ April bill: 435.52
 
 generation fraction = 0.33 from recent bills
 """
+START_YEAR = 2026
+
 # 0.4% degredation per year
 SOLAR_DEGRADATION_FACTOR = 0.004
 
@@ -243,7 +245,7 @@ def chart_solar_hourly_by_month(df: pd.DataFrame, max_y: float):
     row = df.iloc[0]
     month_name = row["month_label"]
     month_num = row["month"]
-    month = date(2025, month_num, 1)
+    month = date(START_YEAR, month_num, 1)
     # add month name as title
     plt.title(f"Hourly solar output {month_name}:  {round(SOLAR_CAPACITY)} kW")
     filename = f"{get_output_dir()}/solar_hourly_{month_label(month)}.png"
@@ -281,7 +283,7 @@ def chart_solar_hourly():
         group = group.groupby("hour").agg({"electricity": "mean"}).reset_index()
         by_month = pd.concat([by_month, group], ignore_index=True)
         group = group.sort_values(by="hour")
-        month_name = datetime(2025, month, 1).strftime("%B")
+        month_name = datetime(START_YEAR, month, 1).strftime("%B")
         color = MONTH_COLORS[i % len(MONTH_COLORS)]
         plt.plot(
             group["hour"],
@@ -437,9 +439,9 @@ def apply_arbitrage(flow: Flow, period_type: str, df_arbitrage: pd.DataFrame) ->
     if flow.timestamp.hour > rows["DateTime"].max().hour:
         return apply_flow(flow, period_type)
 
-    # on a day with an arbitrage opportunity
-    # before the arbitrage hour
-    # charge the battery as much as possible; use the grid if needed
+    # before the arbitrage hour on a day with an arbitrage opportunity
+    # send all solar to the battery
+    # use the grid for demand
     demand = flow.demand
     # first charge the battery because it will be more valuable later
     flow.to_battery = min(
@@ -453,13 +455,15 @@ def apply_arbitrage(flow: Flow, period_type: str, df_arbitrage: pd.DataFrame) ->
         flow.from_grid = demand
     # if it's the arbitrage hour, dump the battery to grid
     if flow.timestamp.hour == target_hour:
-        battery_level = flow.start_battery_level + flow.to_battery
         max_discharge = rows["target discharge"].max()
-        discharge = min(battery_level, max_discharge)
+        battery_level = flow.start_battery_level + flow.to_battery
+        discharge = min(battery_level, target_row["target discharge"])
         if target_row["target discharge"] < max_discharge:
             # if this is not the best discharge error
-            # limit discharge to save for the next hour
-            discharge = max(battery_level - max_discharge, 0)
+            # keep max_discharge in battery for next hour
+            max_discharge = max(battery_level - max_discharge, 0)
+            discharge = min(discharge, max_discharge)
+        discharge = float(discharge)
         print(
             f"arbitrage: {flow.timestamp}\tbattery\t{battery_level:.1f}"
             f"\tdischarge\t{discharge:.1f}\t{target_row["total credit"]:.1f}"
@@ -670,7 +674,7 @@ def chart_monthly_sources(df: pd.DataFrame):
     )
     df_monthly = df_monthly.reset_index()
     df_monthly["month_label"] = df_monthly["month"].apply(
-        lambda x: datetime(2025, x, 1).strftime("%b")
+        lambda x: datetime(START_YEAR, x, 1).strftime("%b")
     )
     # stack bars for from_solar, from_battery, from_grid
     ax.bar(
@@ -1013,6 +1017,7 @@ def print_summary(
             + df_monthly["bonus credit applied"].sum()
         ) / df_monthly["to_grid"].sum()
         savings = grid_cost - net_cost
+        # TODO: want actual generation cost
         row.update(
             {
                 f"{tariff} grid cost": grid_cost,
@@ -1087,6 +1092,13 @@ def print_summary(
     row["payback period"] = payback_period
     row["IRR"] = irr
     row["tariff"] = FORECAST_TARIFF
+    # TODO: merge with Jinja template
+    # arbitrage-20/costs_{01-15}.png
+    # arbitrage-20/credits_{01-15}.png
+    # arbitrage-20/daily_{01-12}.png
+    # arbitrage-20/flow_{01-12}.png
+    # arbitrage-20/monthly_sources.png
+    # arbitrage-20/roi.png
     print("\n".join(lines))
     filename = f"{get_output_dir()}/summary.md"
     with open(filename, "w") as f:
@@ -1237,7 +1249,7 @@ def label_from_params():
 def cost_chart_setup(ax):
     x = np.arange(1, 13)
     ax.set_xticks(x)
-    months = [date(2025, month, 1).strftime("%b") for month in x]
+    months = [date(START_YEAR, month, 1).strftime("%b") for month in x]
     ax.set_xticklabels(months)
     ax.legend()
     # add grid lines
@@ -1390,16 +1402,20 @@ def chart_credits(df_monthly: pd.DataFrame, tariff: str, year: int = 1):
         label="bonus export credit",
         alpha=0.6,
     )
-    total_credit = df_monthly["credits used"].sum()
     df_monthly["credit per kWh"] = df_monthly["credits created"] / df_monthly["to_grid"]
     df_monthly["credit per kWh"] = df_monthly["credit per kWh"].fillna(0.0)
     ax.set_title(f"{label_from_params()} export credit: year {year}")
     last_row = df_monthly.iloc[-1]
+    gen_credit_used = round(gen_used.sum())
+    gen_credit_created = round(gen_created.sum())
+    gen_credit_usage = 0.0
+    if gen_credit_created:
+        gen_credit_usage = round(gen_credit_used / gen_credit_created * 100)
     gen_credit = round(last_row["generation rollover credit"])
     delivery_credit = round(last_row["delivery rollover credit"])
     bonus_credit = round(last_row["bonus rollover credit"])
     text = (
-        f"${total_credit:,.0f} credits applied\n"
+        f"{gen_credit_usage}% generation credits used\n"
         f"${gen_credit:,.0f} generation rollover credit\n"
         f"${delivery_credit:,.0f} delivery rollover credit\n"
         f"${bonus_credit:,.0f} bonus rollover credit\n"
@@ -1495,16 +1511,17 @@ def chart_costs(df_monthly: pd.DataFrame, tariff: str, year: int = 1):
     generation_credit = round(df_monthly.iloc[11]["generation rollover credit"])
     bonus_credit = round(df_monthly.iloc[11]["bonus rollover credit"])
     savings_pct = round(solar_cost / grid_cost * 100)
-    total_savings = grid_cost - solar_cost
+    generational_total = df_monthly[f"{tariff} generation cost"].sum()
     # group by month, sum net cost {tariff}
     monthly_bill = solar_cost / 12
     ax.set_title(f"{tariff} cost: {label_from_params()} year {year}")
 
     text = (
-        f"${total_savings:,.0f} annual savings\n"
+        # f"${total_savings:,.0f} annual savings\n"
         f"${monthly_bill:,.0f} average monthly bill\n"
-        f"{savings_pct}% of PG&E cost\n"
+        f"${generational_total:,.0f} generation cost\n"
         f"${generation_credit:,.0f} generation rollover credit\n"
+        f"{savings_pct}% of PG&E cost\n"
     )
     if delivery_credit:
         text += f"${delivery_credit:,.0f} delivery rollover credit\n"
@@ -1579,7 +1596,7 @@ def calculate_roi(df: pd.DataFrame, df_arbitrage: pd.DataFrame, config: dict):
     """
     Timestamp,kW,hour,yyyymm,month,day,ymd,season,period,period_type
     """
-    current_year = 2025
+    current_year = START_YEAR
     years = 15
     hourly_output = load_hourly_output()
     df_years = pd.DataFrame()
@@ -1684,9 +1701,9 @@ def calculate_roi(df: pd.DataFrame, df_arbitrage: pd.DataFrame, config: dict):
     return df_years, years, irr
 
 
-def load_arbitrage_targets():
-    max_discharge = BATTERY_CAPACITY * BATTERY_DISCHARGE_RATIO
-    remainder_discharge = BATTERY_CAPACITY - max_discharge
+def load_arbitrage_targets(arbitrage_discharge: float) -> pd.DataFrame:
+    max_discharge = min(BATTERY_CAPACITY * BATTERY_DISCHARGE_RATIO, arbitrage_discharge)
+    remainder_discharge = min(0, arbitrage_discharge - max_discharge)
     df = pd.read_csv("data/arbitrage_targets.csv", parse_dates=["DateTime"])
     # sort by total_credit descending then by DateTime ascending
     df = df.sort_values(by=["total credit", "DateTime"], ascending=[False, True])
@@ -1746,7 +1763,9 @@ def main(config: dict):
     hourly_output = load_hourly_output()
 
     if config.get("model", "flow") == "arbitrage":
-        df_arbitrage = load_arbitrage_targets()
+        df_arbitrage = load_arbitrage_targets(
+            config.get("arbitrage_discharge", BATTERY_CAPACITY)
+        )
     else:
         df_arbitrage = pd.DataFrame()
 
@@ -1768,8 +1787,8 @@ def main(config: dict):
     max_y = df[["demand", "solar_generation"]].max().max() * 1.1
     # chart for each month
     for month, group in df.groupby(df["month"]):
-        chart_flows(group, date(2025, month, 1), max_y=max_y)
-        chart_daily(group, date(2025, month, 1))
+        chart_flows(group, date(START_YEAR, month, 1), max_y=max_y)
+        chart_daily(group, date(START_YEAR, month, 1))
 
     # chart_solar_hourly()
     write_to_sheet(df, config["output"])
