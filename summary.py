@@ -1,3 +1,4 @@
+import argparse
 import os
 import yaml
 import pandas as pd
@@ -8,24 +9,15 @@ import matplotlib.dates as mdates
 from util import COLORS
 
 
-def chart_cumulative(scenarios: dict[str, dict]):
+def chart_cumulative(scenarios: dict[str, dict], suffix: str):
     fig, ax = plt.subplots(figsize=(12, 6))
     colors = [
-        "#a6cee3",
-        "#1f78b4",
-        "#b2df8a",
-        "#33a02c",
-        "#fb9a99",
-        "#e31a1c",
-        "#fdbf6f",
-        "#ff7f00",
-        "#cab2d6",
-        "#6a3d9a",
-        "#ffff99",
-        "#b15928",
+        "#1b9e77",
+        "#d95f02",
+        "#7570b3",
+        "#e7298a",
+        "#66a61e",
     ]
-    df = pd.read_csv("output/summary.csv")
-
     for i, key in enumerate(scenarios):
         scenario = scenarios[key]
         filename = f"{scenario['output']}/roi.csv"
@@ -79,7 +71,7 @@ def chart_cumulative(scenarios: dict[str, dict]):
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
     ax.legend()
     plt.tight_layout()
-    filename = "output/roi.png"
+    filename = f"output/roi{suffix}.png"
     fig.savefig(filename, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
@@ -153,18 +145,28 @@ def chart_daily_actual():
     print(f"wrote {filename}")
 
 
-def main():
+def main(scenario_set: str):
     # read all .yml files in the current directory
     df = pd.DataFrame()
+    sets = {
+        "base": [
+            "solar-8-battery-30.yml",
+            "solar-10-battery-30.yml",
+            "solar-10-battery-45.yml",
+            "solar-8-battery-30-rate-8.yml",
+            "arbitrage-limit-8.yml",
+        ],
+        "arbitrage": [
+            "arbitrage-max.yml",
+            "arbitrage-limit-10.yml",
+            "arbitrage-limit-20.yml",
+            "arbitrage-limit-8.yml",
+        ],
+    }
+    suffix = "-arbitrage" if scenario_set == "arbitrage" else ""
+    included = sets[scenario_set]
     scenarios = {}
-    included = [
-        "solar-10-battery-30-actual.yml",
-        "solar-8-battery-30-arbitrage.yml",
-        "solar-10-battery-30.yml",
-        "solar-10-battery-45.yml",
-        "solar-8-battery-30-rate-8.yml",
-        "solar-8-battery-30.yml",
-    ]
+
     for file in included:
         # parse the yml file
         print(f"reading {file}")
@@ -178,7 +180,7 @@ def main():
         summary = pd.read_csv(filename)
         df = pd.concat([df, summary])
     df = df.sort_values(by="IRR")
-    df.to_csv("output/summary.csv", index=False)
+    df.to_csv(f"output/summary{suffix}.csv", index=False)
     print("scenario\ttariff\tyear 1 savings\tpayback period\tIRR\tsolar %")
     for _, row in df.iterrows():
         solar_pct = 1 - (row["from_grid"] / row["demand"])
@@ -186,10 +188,13 @@ def main():
             f"{row['scenario']}\t{row['tariff']}\t{row['savings']:,.0f}\t"
             f"{row['payback period']:.1f}\t{row['IRR']:.2%}\t{solar_pct:.0%}"
         )
-    chart_cumulative(scenarios)
+    chart_cumulative(scenarios, suffix)
     # summarize_periods(list(paths.keys())[0])
-    chart_daily_actual()
+    # chart_daily_actual()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("set", type=str, default="base", nargs="?")
+    args = parser.parse_args()
+    main(args.set)
