@@ -985,6 +985,8 @@ def print_summary(
     lines.append(
         f"min battery level: summer={round(MIN_BATTERY_SUMMER)} kWh winter={round(MIN_BATTERY_WINTER)} kWh"
     )
+    if config["model"] == "arbitrage":
+        lines.append(f"arbitrage: up to {config['arbitrage_discharge']} kWh")
 
     # average daily use by period type
     lines.append("## Average daily use by period\n")
@@ -1489,6 +1491,49 @@ def chart_costs(df_monthly: pd.DataFrame, tariff: str, year: int = 1):
         label=f"solar + battery generation ${cost:,.0f}",
         color=COLORS["generation"],
     )
+    # credits
+    bonus_credit = df_monthly["bonus credit applied"]
+    credit_value = round(bonus_credit.sum())
+    ax.bar(
+        df_monthly["month"],
+        bonus_credit,
+        bottom=delivery_cost + other_cost + generation_cost,
+        label=f"bonus credit applied ${credit_value:,.0f}",
+        color=COLORS["bonus"],
+        alpha=0.2,
+        hatch="//",
+        edgecolor="gray",
+    )
+    delivery_credit = df_monthly["delivery credit applied"]
+    credit_value = round(delivery_credit.sum())
+    ax.bar(
+        df_monthly["month"],
+        delivery_credit,
+        bottom=delivery_cost + other_cost + generation_cost + bonus_credit,
+        label=f"delivery credit applied ${credit_value:,.0f}",
+        color=COLORS["delivery"],
+        alpha=0.2,
+        hatch="//",
+        edgecolor="gray",
+    )
+    generation_credit = df_monthly["generation credit applied"]
+    credit_value = round(generation_credit.sum())
+    ax.bar(
+        df_monthly["month"],
+        generation_credit,
+        bottom=delivery_cost
+        + other_cost
+        + generation_cost
+        + bonus_credit
+        + delivery_credit,
+        label=f"generation credit applied ${credit_value:,.0f}",
+        color=COLORS["generation"],
+        alpha=0.2,
+        hatch="//",
+        edgecolor="gray",
+    )
+
+    """
     credit = (
         df_monthly["delivery credit applied"]
         + df_monthly["generation credit applied"]
@@ -1503,6 +1548,7 @@ def chart_costs(df_monthly: pd.DataFrame, tariff: str, year: int = 1):
         # dotted line
         linestyle="--",
     )
+    """
     cost_chart_setup(ax)
     ax.set_ylabel("cost $")
     grid_cost = round(df_monthly[f"{tariff} grid cost"].sum())
