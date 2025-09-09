@@ -6,6 +6,7 @@ from typing import Any
 import calendar
 
 import gspread
+import jinja2
 from gspread import Spreadsheet
 from gspread.utils import ValueInputOption
 import matplotlib.pyplot as plt
@@ -29,6 +30,17 @@ from util import (
 
 # https://www.pge.com/assets/pge/docs/account/rate-plans/residential-electric-rate-plan-pricing.pdf
 # https://www.pge.com/tariffs/assets/pdf/tariffbook/ELEC_SCHEDS_E-ELEC.pdf
+
+r"""
+outputs
+
+costs_{01-15}.png - costs by month, 15 years
+credits_{01-15}.png - credit by month, 15 years
+daily_{01-12}.png - sources by day per month
+flow_{01-12}.png - sources by hour per month, with battery
+monthly_sources.png - sources by month
+roi.png - cumulative savings by month, 15 years
+"""
 
 """
 solar panels
@@ -98,7 +110,7 @@ MIN_BATTERY_SUMMER = BASE_MIN_BATTERY_SUMMER
 
 ANNUAL_RATE_INCREASE = 0.04
 
-DEFAULT_USAGE = "data/charging.csv"
+DEFAULT_USAGE = "data/usage.csv"
 
 OUTPUT_DIR = "output"
 
@@ -128,7 +140,7 @@ MONTH_COLORS = [
 
 
 def month_label(month: date) -> str:
-    return month.strftime("%m")
+    return month.strftime("%b")
 
 
 def set_params(config: dict):
@@ -177,26 +189,6 @@ def set_rates(df: pd.DataFrame, tariff: str, rates: dict[str, Any]) -> pd.DataFr
         df["Timestamp"].dt.year <= BONUS_END_YEAR, BONUS_CREDIT, 0.0
     )
     return df
-
-
-def load_output() -> dict[str, float]:
-    """Load hourly output estimate from output.csv
-
-    day,kW
-    01-01,49.18
-    from https://www.renewables.ninja
-    """
-    output: dict[str, float] = {}
-    with open("data/output.csv") as f:
-        for line in f.readlines():
-            if not line:
-                continue
-            md, kw = line.strip().split(",")
-            try:
-                output[md] = float(kw) * SOLAR_CAPACITY / BASE_SOLAR_CAPACITY
-            except ValueError:
-                continue
-    return output
 
 
 def chart_solar_hourly_by_month(df: pd.DataFrame, max_y: float):
@@ -967,6 +959,83 @@ def get_output_dir():
     return OUTPUT_DIR
 
 
+def generate_summary(
+    df_years: pd.DataFrame,
+    config: dict,
+    demand: float,
+    payback_period: float,
+    irr: float,
+):
+
+    context = {
+        "description": config["description"],
+        "solar": f"{round(SOLAR_CAPACITY):,.0f}",
+        "battery": f"{round(BATTERY_CAPACITY)}",
+        "rate_increase": f"{round(ANNUAL_RATE_INCREASE*100)}",
+        "min_battery_summer": f"{round(MIN_BATTERY_SUMMER)}",
+        "min_battery_winter": f"{round(MIN_BATTERY_WINTER)}",
+        "system_cost": f"{config['system_cost']:,.0f}",
+        "model": f"{config.get('model', 'flow')}",
+        "arbitrage_discharge": f"{config['arbitrage_discharge']}",
+        "payback_period": f"{payback_period:.1f}",
+        "irr": f"{irr:.2%}",
+        "path": OUTPUT_DIR,
+        "tariff": FORECAST_TARIFF,
+        "years": int(len(df_years.index) / 12),
+        "demand": f"{demand:,.0f}",
+    }
+    """ df_years = one row per month
+    ['month', 'year_month', 'to_grid', 'generation net cost',
+            'generation credit applied', 'generation rollover credit',
+            'delivery net cost', 'delivery credit applied',
+            'delivery rollover credit', 'bonus credit applied',
+            'bonus rollover credit', 'grid cost', 'net cost', 'savings',
+            'cumulative savings', 'cumulative pge', 'cumulative net', 'year']
+    """
+    # year 2 results to get full effect of summer credits
+    df_year2 = df_years.iloc[13:24]
+    # rollover from last row of df_year2
+    last_row = df_year2.iloc[-1]
+    delivery_credit = df_year2["delivery credit applied"].sum()
+    total_delivery_credit = last_row["delivery rollover credit"] + delivery_credit
+    generation_credit = df_year2["generation credit applied"].sum()
+    total_generation_credit = last_row["generation rollover credit"] + generation_credit
+    to_grid = df_year2["to_grid"].sum()
+    from_grid = df_year2["from_grid"].sum()
+    credit_per_kwh = (total_delivery_credit + total_generation_credit) / to_grid
+    # excludes rollover (unused)
+    effective_credit_per_kwh = (delivery_credit + generation_credit) / to_grid
+    cost_per_kwh = df_year2["net cost"].sum() / demand
+    context.update(
+        {
+            "grid_cost": f"{df_year2["grid cost"].sum():,.0f}",
+            "net_cost": f"{df_year2["net cost"].sum():,.0f}",
+            "savings": f"{df_year2["savings"].sum():,.0f}",
+            "credit_per_kwh": f"{credit_per_kwh:,.2f}",
+            "cost_per_kwh": f"{cost_per_kwh:,.4f}",
+            "effective_credit_per_kwh": f"{effective_credit_per_kwh:,.2f}",
+            "to_grid": f"{to_grid:,.0f}",
+            "from_grid": f"{from_grid:,.0f}",
+            "from_grid_pct": f"{round(from_grid / demand * 100):.0f}",
+            "generation_credit_applied": f"{generation_credit:,.0f}",
+            "generation_credit_rollover": f"{last_row['generation rollover credit']:,.0f}",
+            "delivery_credit_applied": f"{delivery_credit:,.0f}",
+            "delivery_credit_rollover": f"{last_row['delivery rollover credit']:,.0f}",
+            "bonus_credit_applied": f"{df_year2['bonus credit applied'].sum():,.0f}",
+            "bonus_credit_rollover": f"{last_row['bonus rollover credit']:,.0f}",
+        }
+    )
+    # load summary.jinja2
+    with open("data/summary.jinja2", "r") as f:
+        template = f.read()
+    # render a template with Jinja2
+    rendered = jinja2.Template(template).render(context)
+    # write to summary.md
+    with open(f"{get_output_dir()}/summary.md", "w") as f:
+        f.write(rendered)
+    print(f"wrote summary to {get_output_dir()}/summary.md")
+
+
 def print_summary(
     df: pd.DataFrame,
     monthly_costs: dict[str, pd.DataFrame],
@@ -974,6 +1043,7 @@ def print_summary(
     payback_period: float,
     irr: float,
 ):
+    # TODO: keep summary.csv output, drop lines
     lines: list[str] = []
     lines.append(f"## {label_from_params()}\n")
     lines.append(f"solar capacity: {round(SOLAR_CAPACITY)} kW")
@@ -985,7 +1055,7 @@ def print_summary(
     lines.append(
         f"min battery level: summer={round(MIN_BATTERY_SUMMER)} kWh winter={round(MIN_BATTERY_WINTER)} kWh"
     )
-    if config["model"] == "arbitrage":
+    if config.get("model", "flow") == "arbitrage":
         lines.append(f"arbitrage: up to {config['arbitrage_discharge']} kWh")
 
     # average daily use by period type
@@ -1097,8 +1167,8 @@ def print_summary(
     # TODO: merge with Jinja template
     # arbitrage-20/costs_{01-15}.png
     # arbitrage-20/credits_{01-15}.png
-    # arbitrage-20/daily_{01-12}.png
-    # arbitrage-20/flow_{01-12}.png
+    # arbitrage-20/daily_{Jan-Dec}.png
+    # arbitrage-20/flow_{Jan-Dec}.png
     # arbitrage-20/monthly_sources.png
     # arbitrage-20/roi.png
     print("\n".join(lines))
@@ -1291,6 +1361,7 @@ def calculate_monthly_costs(
                 f"{tariff} other cost": "sum",
                 f"{tariff} grid cost": "sum",
                 "to_grid": "sum",
+                "from_grid": "sum",
             }
         )
         .reset_index()
@@ -1673,8 +1744,6 @@ def calculate_roi(df: pd.DataFrame, df_arbitrage: pd.DataFrame, config: dict):
         print(
             f"year {year} solar efficiency: {solar_efficiency} off peak rate: {rates[FORECAST_TARIFF]['winter off peak']}"
         )
-        if year == 3:
-            print("check on year 3 credits")
         df_year = df.copy()
         df_year["Timestamp"] = df["Timestamp"] + pd.Timedelta(days=365 * year)
         df_year["solar_efficiency"] = solar_efficiency
@@ -1727,6 +1796,7 @@ def calculate_roi(df: pd.DataFrame, df_arbitrage: pd.DataFrame, config: dict):
         "month",
         "year_month",
         "to_grid",
+        "from_grid",
         "generation net cost",
         "generation credit applied",
         "generation rollover credit",
@@ -1826,7 +1896,8 @@ def main(config: dict):
 
     df_roi, payback_period, irr = calculate_roi(df_initial, df_arbitrage, config)
     chart_roi(df_roi, payback_period, irr)
-    print_summary(df, monthly_costs, config, payback_period, irr)
+    #  print_summary(df, monthly_costs, config, payback_period, irr)
+    generate_summary(df_roi, config, df_initial["demand"].sum(), payback_period, irr)
 
     chart_monthly_sources(df)
 
