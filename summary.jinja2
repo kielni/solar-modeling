@@ -1,0 +1,75 @@
+# {{description}}
+
+| Parameter | Value |
+|--------|-------:|
+| Solar panels | {{solar}}kW |
+| Battery | {{battery}} kWh |
+| Annual rate increase | {{rate_increase}}% |
+| Min battery: summary | {{min_battery_summer}} |
+| Min battery: winter | {{min_battery_winter}} |
+| System cost | ${{system_cost}} |
+| Model | {{model}} |
+| Arbitrage discharge | {{arbitrage_discharge}}kWh|
+| Demand | {{demand}} kWh |
+| Tariff | {{tariff}} |
+
+## Overall results ({{years}} years)
+
+|  |  |
+|--------|-------:|
+| blended cost per kWh | ${{cost_per_kwh}} |
+| payback period | {{payback_period}} years |
+| IRR | {{irr}} |
+
+<img src="roi.png">
+
+<img src="monthly_sources.png">
+
+### by month
+
+### January
+<img src="daily_Jan.png">
+
+<img src="flow_Jan.png">
+
+### July
+<img src="daily_Jul.png">
+
+<img src="flow_Jul.png">
+
+### October
+
+<img src="daily_Oct.png">
+
+<img src="flow_Oct.png">
+
+## Year 2 results
+
+|  |  |
+|--------|-------:|
+| Grid cost | ${{grid_cost}} |
+| Net cost | ${{net_cost}} | 
+| Savings | ${{savings}} |
+| From grid | {{from_grid}} kWh |
+| From grid % | {{from_grid_pct}}% |
+| To grid | {{to_grid}} kW |
+| Credit per kWh | ${{credit_per_kwh}} |
+| Applied credit per kWh | ${{effective_credit_per_kwh}} |
+
+### Credits
+
+| Credit type | Applied | Rollover (unused) |
+|--------|-------:|-------:|
+| Generation | ${{generation_credit_applied}} | ${{generation_credit_rollover}} |
+| Delivery credit | ${{delivery_credit_applied}} | ${{delivery_credit_rollover}} |
+| Bonus | ${{bonus_credit_applied}} | ${{bonus_credit_rollover}} |
+
+<img src="costs_02.png">
+
+<img src="credits_02.png">
+
+## Year 5 results
+
+<img src="costs_05.png">
+
+<img src="credits_05.png">

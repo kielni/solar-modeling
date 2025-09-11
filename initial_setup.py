@@ -97,7 +97,7 @@ def copy_charging() -> pd.DataFrame:
 def pge_export():
     """Reformat PG&E export data file.
 
-    Load giant PG&E data file, keep only generation rates, convert UTC to PST/PDT,
+    Load giant PG&E data file, convert UTC to PST/PDT,
     and write to output/pge-export.csv
 
     RateLookupID Column:

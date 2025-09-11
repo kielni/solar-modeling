@@ -87,12 +87,60 @@ Winter Usage $0.24606 (R) $0.24185 (R) $0.09664 (R)
 OTHER = 0.05671
 RATE_VALUES = {
     "ELEC": {
-        "summer peak": Charges(generation=0.31659, delivery=0.23100, other=OTHER),
-        "summer part peak": Charges(generation=0.21748, delivery=0.16823, other=OTHER),
-        "summer off peak": Charges(generation=0.17238, delivery=0.15665, other=OTHER),
-        "winter peak": Charges(generation=0.15446, delivery=0.16162, other=OTHER),
-        "winter part peak": Charges(generation=0.13449, delivery=0.15950, other=OTHER),
-        "winter off peak": Charges(generation=0.12114, delivery=0.15899, other=OTHER),
+        # $0.60430
+        "summer peak": Charges(
+            # 52%
+            generation=0.31659,
+            # 38%
+            delivery=0.23100,
+            # 9%
+            other=OTHER,
+        ),
+        # $0.44242
+        "summer part peak": Charges(
+            # 49%
+            generation=0.21748,
+            # 38%
+            delivery=0.16823,
+            # 13%
+            other=OTHER,
+        ),
+        # $0.38574
+        "summer off peak": Charges(
+            # 45%
+            generation=0.17238,
+            # 41%
+            delivery=0.15665,
+            # 15%
+            other=OTHER,
+        ),
+        # $0.37279
+        "winter peak": Charges(
+            # 41%
+            generation=0.15446,
+            # 43%
+            delivery=0.16162,
+            # 15%
+            other=OTHER,
+        ),
+        # $0.35070
+        "winter part peak": Charges(
+            # 38%
+            generation=0.13449,
+            # 46%
+            delivery=0.15950,
+            # 16%
+            other=OTHER,
+        ),
+        # $0.33684
+        "winter off peak": Charges(
+            # 36%
+            generation=0.12114,
+            # 47%
+            delivery=0.15899,
+            # 17%
+            other=OTHER,
+        ),
     },
 }
 """
