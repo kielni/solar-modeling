@@ -67,7 +67,10 @@ def copy_charging_orig(
 
 
 def copy_charging() -> pd.DataFrame:
-    """Read the usage data, copy charging data back to previous months, and shift from 12-3am to 12-3pm.
+    """Copy limited charging history to previous months.
+
+    Read the usage data, copy charging data back to previous months, and
+    shift from 12-3am to 12-3pm.
 
     Timestamp,kW
     8/13/2025 11:00 PM,0.92
@@ -104,7 +107,10 @@ def pge_export():
         If the RateLookupID includes “USCA-PGXX” that indicates Delivery Export Rates.
         If the RateLookupID includes “USCA-XXPG” that indicate Generation Export Rates*.
         *Generation Export Rates are only applicable to SBP customers that receive
-        bundled generation service from PG&E. Customers that receive generation service from a Community Choice Aggregator (CCA) or a Direct Access (DA) provider should refer to that generation service provider for more information about the generation export pricing available to them.
+        bundled generation service from PG&E. Customers that receive generation service
+        from a Community Choice Aggregator (CCA) or a Direct Access (DA) provider should
+        refer to that generation service provider for more information about the generation
+        export pricing available to them.
 
     RateName Column:
         The number that follows “NBT” represents the legacy pricing for that year.

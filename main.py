@@ -2,13 +2,14 @@ import argparse
 import csv
 from datetime import date, datetime
 import os
-from typing import Any
+from typing import Any, Optional
 import calendar
+from dataclasses import dataclass
 
 import gspread
-import jinja2
 from gspread import Spreadsheet
 from gspread.utils import ValueInputOption
+import jinja2
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 import matplotlib.dates as mdates
@@ -72,7 +73,8 @@ options
 
 """
 https://www.franklinwh.com/support/overview/grid-charge--export/
-Note: In states such as California, regulations prohibit batteries from discharging to the grid if the grid was used to charge the batteries.
+Note: In states such as California, regulations prohibit batteries from discharging
+to the grid if the grid was used to charge the batteries.
 
 Credits only apply to generation:
 April bill: 435.52
@@ -80,47 +82,69 @@ April bill: 435.52
 
 generation fraction = 0.33 from recent bills
 """
+
+"""
+https://sunwatts.com/content/manual/franklin_System_User_Manual.pdf
+
+ the homeowner can select the Time of Use mode to customize the on-peak and
+off-peak times according to the electricity rate. The FranklinWH system will select solar
+and aPower battery power during peak rate periods. During the off-peak periods, the
+system will use power from the grid, the PV system, and the batteries in balance according
+to household loads
+
+One or two time periods may be set for every 24
+hours, to achieve the most economical use of electricity for Smart Circuits.
+"""
+
 START_YEAR = 2026
+ROI_YEARS = 15
 
 # 0.4% degredation per year
 SOLAR_DEGRADATION_FACTOR = 0.004
 
 # capacity value used to generate hourly output
 # from https://www.renewables.ninja
-BASE_SOLAR_CAPACITY = 10
-# scale to parameter value
-SOLAR_CAPACITY = BASE_SOLAR_CAPACITY
+MODELED_SOLAR_CAPACITY = 10.0
 
-BASE_BATTERY_CAPACITY = 30
-# scale to parameter value
-BATTERY_CAPACITY = BASE_BATTERY_CAPACITY
-# max 10 kW per 15 kWh battery
-BATTERY_DISCHARGE_RATIO = 10 / 15
+# usage during peak hours (kWh)
+PEAK_USAGE = 10.0
+DAILY_USE = 43.0
+FORECAST_TARIFF = "ELEC"
 
-# average peak usage
-PEAK_USAGE = 10
-
-# use battery in off peak if it's at least this level
-# might need all daily solar production to offset peak usage
-BASE_MIN_BATTERY_WINTER = PEAK_USAGE
-MIN_BATTERY_WINTER = BASE_MIN_BATTERY_WINTER
-# in summer, let battery go lower since it will likely refill
-BASE_MIN_BATTERY_SUMMER = PEAK_USAGE / 4
-MIN_BATTERY_SUMMER = BASE_MIN_BATTERY_SUMMER
-
-ANNUAL_RATE_INCREASE = 0.04
-
-DEFAULT_USAGE = "data/usage.csv"
-
-OUTPUT_DIR = "output"
-
-DAILY_USE = 43
-
+# TODO: move this to environment variable
 SHEET_ID = "1vSV4EjU8OsduAFK0HzzNbDCx9E8KZpzjp8XyiYHbehQ"
 
 FIRST_PEAK_HOUR = 15
+# max 10 kW per 15 kWh battery
+BATTERY_DISCHARGE_RATIO = 10 / 15
 
-FORECAST_TARIFF = "ELEC"
+
+@dataclass
+class Config:
+    """Set default values, override with yml config file."""
+
+    # solar capacity for this run
+    solar_capacity: float = 10
+    battery_capacity: float = 30
+    # use battery in off peak if it's at least this level
+    # might need all daily solar production to offset peak usage
+    min_battery_winter: float = 10
+    # in summer, let battery go lower since it will likely refill
+    min_battery_summer: float = 2.5
+    annual_rate_increase: float = 0.04
+    usage_filename: str = "data/usage.csv"
+    output_dir: str = "output"
+    model: str = "flow"
+    arbitrage_discharge: Optional[float] = None
+    description: str = "default"
+    system_cost: float = 1
+
+    @property
+    def label(self) -> str:
+        return f"{round(self.solar_capacity)} kW solar, {round(self.battery_capacity)} kWh battery"
+
+
+config = Config()
 
 
 MONTH_COLORS = [
@@ -141,29 +165,6 @@ MONTH_COLORS = [
 
 def month_label(month: date) -> str:
     return month.strftime("%b")
-
-
-def set_params(config: dict):
-    # TODO: less global config
-    global OUTPUT_DIR
-    global BATTERY_CAPACITY
-    global SOLAR_CAPACITY
-    global MIN_BATTERY_WINTER
-    global MIN_BATTERY_SUMMER
-    global ANNUAL_RATE_INCREASE
-    global LABEL
-    OUTPUT_DIR = config["output"]
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR)
-    BATTERY_CAPACITY = BASE_BATTERY_CAPACITY * config["battery"] / BASE_BATTERY_CAPACITY
-    SOLAR_CAPACITY = BASE_SOLAR_CAPACITY * config["solar"] / BASE_SOLAR_CAPACITY
-    MIN_BATTERY_WINTER = config.get("min_battery_winter", MIN_BATTERY_WINTER)
-    MIN_BATTERY_SUMMER = config.get("min_battery_summer", MIN_BATTERY_SUMMER)
-    ANNUAL_RATE_INCREASE = config.get("annual_rate_increase", ANNUAL_RATE_INCREASE)
-    LABEL = config.get(
-        "description",
-        f"{round(SOLAR_CAPACITY)} kW solar, {round(BATTERY_CAPACITY)} kWh battery",
-    )
 
 
 def set_rates(df: pd.DataFrame, tariff: str, rates: dict[str, Any]) -> pd.DataFrame:
@@ -200,7 +201,7 @@ def chart_solar_hourly_by_month(df: pd.DataFrame, max_y: float):
     median_val = round(per_day["electricity"].median())
     days_over_use = per_day[per_day["electricity"] >= DAILY_USE].shape[0]
     over_pct = round(days_over_use / len(per_day) * 100)
-    # initialize the plot
+
     plt.figure(figsize=(10, 6))
     stats_text = (
         f"{min_val} - {max_val} kWh\n"
@@ -229,7 +230,7 @@ def chart_solar_hourly_by_month(df: pd.DataFrame, max_y: float):
             linewidth=2,
             color=colors[day - 1],
         )
-    plt.xticks(range(0, 24, 1))  # set x ticks
+    plt.xticks(range(0, 24, 1))
     plt.title("Average hourly solar output")
     plt.xlabel("Hour")
     plt.ylabel("kW")
@@ -238,9 +239,10 @@ def chart_solar_hourly_by_month(df: pd.DataFrame, max_y: float):
     month_name = row["month_label"]
     month_num = row["month"]
     month = date(START_YEAR, month_num, 1)
+
     # add month name as title
-    plt.title(f"Hourly solar output {month_name}:  {round(SOLAR_CAPACITY)} kW")
-    filename = f"{get_output_dir()}/solar_hourly_{month_label(month)}.png"
+    plt.title(f"Hourly solar output {month_name}:  {round(config.solar_capacity)} kW")
+    filename = f"{config.output_dir}/solar_hourly_{month_label(month)}.png"
     plt.savefig(filename, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"wrote {filename}")
@@ -255,8 +257,10 @@ def chart_solar_hourly():
     )
     columns = ["local_time", "electricity"]
     df = df[columns]
-    df["electricity"] = df["electricity"] * SOLAR_CAPACITY / BASE_SOLAR_CAPACITY
-    # get first row
+    # scale modeled solar capacity to config.solar_capacity
+    df["electricity"] = (
+        df["electricity"] * config.solar_capacity / MODELED_SOLAR_CAPACITY
+    )
     df["month"] = df["local_time"].dt.month
     df["month_label"] = df["local_time"].dt.strftime("%B")
     df["day"] = df["local_time"].dt.day
@@ -285,29 +289,29 @@ def chart_solar_hourly():
             linewidth=2,
         )
     plt.xticks(range(0, 24, 1))
-    plt.title(f"Average hourly solar output: {round(SOLAR_CAPACITY)} kW system")
+    plt.title(f"Average hourly solar output: {round(config.solar_capacity)} kW system")
     plt.xlabel("Hour")
     plt.ylabel("kW")
     plt.legend(labelcolor=label_colors)
-    output_dir = get_output_dir()
     # Set legend text color to red for under_months
-    filename = f"{output_dir}/solar_all_months.png"
+    filename = f"{config.output_dir}/solar_all_months.png"
     plt.savefig(filename, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"wrote {filename}")
     # write data for use by other charts
-    by_month.to_csv(f"{output_dir}/solar_hourly_by_month.csv", index=False)
+    by_month.to_csv(f"{config.output_dir}/solar_hourly_by_month.csv", index=False)
     cols = ["hour", "electricity"]
     by_month = by_month[cols]
     # create grid of all months
     os.system(
-        f"cd {output_dir} ; montage solar_hourly_*.png -tile 3x4 -geometry +2+2 solar_monthly.png; cd .."
+        f"cd {config.output_dir}; "
+        "montage solar_hourly_*.png -tile 3x4 -geometry +2+2 solar_monthly.png; "
+        "cd .."
     )
 
 
 def load_export():
-    df = pd.read_csv("data/pge-export-pt.csv", parse_dates=["DateTime"])
-    return df
+    return pd.read_csv("data/pge-export-pt.csv", parse_dates=["DateTime"])
 
 
 def load_hourly_output() -> dict[str, float]:
@@ -323,7 +327,10 @@ def load_hourly_output() -> dict[str, float]:
     for row in reader:
         # 2018-12-31 16:00
         hour = row["local_time"][5:]
-        output[hour] = float(row["electricity"]) * SOLAR_CAPACITY / BASE_SOLAR_CAPACITY
+        # scale modeled solar capacity to config.solar_capacity
+        output[hour] = (
+            float(row["electricity"]) * config.solar_capacity / MODELED_SOLAR_CAPACITY
+        )
     return output
 
 
@@ -342,7 +349,9 @@ def set_use(df: pd.DataFrame, period_type: str, battery_level: float) -> float:
         df.loc[row.name, "kW grid use"] = use - battery_use
         total_battery_use += battery_use
         current_battery_level -= battery_use
-        df.loc[row.name, "battery percent"] = current_battery_level / BATTERY_CAPACITY
+        df.loc[row.name, "battery percent"] = (
+            current_battery_level / config.battery_capacity
+        )
     return total_battery_use
 
 
@@ -364,25 +373,12 @@ class Flow(BaseModel):
 def min_battery_level(month: int) -> float:
     """Return minimum battery level to maintain during off peak hours."""
     if month >= 6 and month <= 9:
-        return MIN_BATTERY_SUMMER
-    return MIN_BATTERY_WINTER
-
-
-"""
-https://sunwatts.com/content/manual/franklin_System_User_Manual.pdf
-
- the homeowner can select the Time of Use mode to customize the on-peak and
-off-peak times according to the electricity rate. The FranklinWH system will select solar
-and aPower battery power during peak rate periods. During the off-peak periods, the
-system will use power from the grid, the PV system, and the batteries in balance according
-to household loads
-
-One or two time periods may be set for every 24
-hours, to achieve the most economical use of electricity for Smart Circuits.
-"""
+        return config.min_battery_summer
+    return config.min_battery_winter
 
 
 def apply_flow(flow: Flow, period_type: str) -> Flow:
+    """Set values in flow model for this period type."""
     demand = flow.demand
     min_battery = min_battery_level(flow.timestamp.month)
     # from solar first
@@ -398,7 +394,9 @@ def apply_flow(flow: Flow, period_type: str) -> Flow:
         else:
             # to battery
             excess = flow.solar_generation - flow.from_solar
-            flow.to_battery = min(BATTERY_CAPACITY - flow.start_battery_level, excess)
+            flow.to_battery = min(
+                config.battery_capacity - flow.start_battery_level, excess
+            )
     else:  # off peak
         # from battery if battery is high enough
         if demand and flow.start_battery_level > min_battery:
@@ -409,7 +407,9 @@ def apply_flow(flow: Flow, period_type: str) -> Flow:
         else:
             # to battery
             excess = flow.solar_generation - flow.from_solar
-            flow.to_battery = min(excess, BATTERY_CAPACITY - flow.start_battery_level)
+            flow.to_battery = min(
+                excess, config.battery_capacity - flow.start_battery_level
+            )
     # to grid
     flow.to_grid = flow.solar_generation - flow.from_solar - flow.to_battery
     # update battery level
@@ -420,6 +420,7 @@ def apply_flow(flow: Flow, period_type: str) -> Flow:
 
 
 def apply_arbitrage(flow: Flow, period_type: str, df_arbitrage: pd.DataFrame) -> Flow:
+    """Set values in flow model for arbitrage."""
     # might be up to two targets per day
     target = df_arbitrage[df_arbitrage["DateTime"] == pd.Timestamp(flow.timestamp)]
     if target.empty:
@@ -437,7 +438,7 @@ def apply_arbitrage(flow: Flow, period_type: str, df_arbitrage: pd.DataFrame) ->
     demand = flow.demand
     # first charge the battery because it will be more valuable later
     flow.to_battery = min(
-        BATTERY_CAPACITY - flow.start_battery_level, flow.solar_generation
+        config.battery_capacity - flow.start_battery_level, flow.solar_generation
     )
     # then use solar to meet demand
     available_solar = flow.solar_generation - flow.to_battery
@@ -451,7 +452,7 @@ def apply_arbitrage(flow: Flow, period_type: str, df_arbitrage: pd.DataFrame) ->
         battery_level = flow.start_battery_level + flow.to_battery
         discharge = min(battery_level, target_row["target discharge"])
         if target_row["target discharge"] < max_discharge:
-            # if this is not the best discharge error
+            # if this is not the best discharge hour
             # keep max_discharge in battery for next hour
             max_discharge = max(battery_level - max_discharge, 0)
             discharge = min(discharge, max_discharge)
@@ -480,7 +481,7 @@ def calculate_v3(
 ) -> pd.DataFrame:
     rows = []
     # initial battery level for the model
-    battery_level = BATTERY_CAPACITY / 2
+    battery_level = config.battery_capacity / 2
     arbitrage_dates = (
         set(df_arbitrage["DateTime"].dt.date.unique())
         if not df_arbitrage.empty
@@ -504,7 +505,6 @@ def calculate_v3(
         else:
             flow = apply_flow(flow, row["period_type"])
         battery_level = flow.end_battery_level
-        # print(flow)
         rows.append(flow.model_dump(mode="json"))
     df_flows = pd.DataFrame(rows)
     # add pd.Timestamp column to df_flows from timestamp
@@ -512,7 +512,7 @@ def calculate_v3(
     df = df.merge(df_flows, on="Timestamp", how="left")
     # both df and df_flows have demand column; drop one
     df["demand"] = df["demand_x"]
-    filename = f"{get_output_dir()}/flows_v3{suffix}.csv"
+    filename = f"{config.output_dir}/flows_v3{suffix}.csv"
     cols = [
         "Timestamp",
         "season",
@@ -702,33 +702,37 @@ def chart_monthly_sources(df: pd.DataFrame):
     ax.set_ylabel("kWh")
     ax.axhline(0, color="black", linewidth=1)
     ax.set_title(
-        f"Sources by month:  {round(SOLAR_CAPACITY)} kW solar, {round(BATTERY_CAPACITY)} kWh battery"
+        f"Sources by month:  {round(config.solar_capacity)} kW solar, "
+        f"{round(config.battery_capacity)} kWh battery"
     )
     ax.set_axisbelow(True)
     ax.grid(axis="y", color="lightgray", alpha=0.7)
-    # draw horizontal line at y=0
-    # add title: Sources by month:  10 kW solar, 30 kWh battery
-    # draw horizontal grid lines
     plt.tight_layout()
-    fig.savefig(f"{get_output_dir()}/monthly_sources.png", dpi=300, bbox_inches="tight")
+    fig.savefig(
+        f"{config.output_dir}/monthly_sources.png", dpi=300, bbox_inches="tight"
+    )
     plt.close(fig)
 
 
 def highlight_peak(ax: plt.Axes):
+    """Add shading for peak and part peak hours."""
     ax.set_xlim(-0.5, 23.5)
+    ax.set_axisbelow(True)
+    ax.grid(axis="y", color="lightgray", alpha=0.7)
     # part peak: with light yellow color for hour=15, hour=21-23
     ax.axvspan(15, 24, color=COLORS["part peak"], alpha=1.0)
     # peak: full height bar with light red color for hour=16-20
     ax.axvspan(16, 20, color=COLORS["peak"], alpha=0.5)
-    ax.set_axisbelow(True)
-    ax.grid(axis="y", color="lightgray", alpha=0.7)
 
 
 def chart_flows(df: pd.DataFrame, month: date, max_y: float):
-    # positive: from_solar + from_battery + from_grid = demand
-    # negative: to_battery + to_grid = excess
-    # solar generation, demand
-    # battery level
+    """Chart flows for a single month.
+
+    positive: from_solar + from_battery + from_grid = demand
+    negative: to_battery + to_grid = excess
+    solar generation, demand
+    battery level
+    """
     print(f"charting flows for {month.strftime('%B')}")
     cols = [
         "from_solar",
@@ -762,11 +766,11 @@ def chart_flows(df: pd.DataFrame, month: date, max_y: float):
     axs[0].set_ylim(-min_y, max_y)
     chart_demand(df_hourly, axs[0])
     chart_excess(df_hourly, axs[0])
-    axs[1].set_ylim(0, BATTERY_CAPACITY * 1.05)
+    axs[1].set_ylim(0, config.battery_capacity * 1.05)
     plt.tight_layout()
-    plt.suptitle(f"{month.strftime('%B')} hourly: {label_from_params()}", y=1.00)
+    plt.suptitle(f"{month.strftime('%B')} hourly: {config.label}", y=1.00)
     fig.savefig(
-        f"{get_output_dir()}/flow_{month_label(month)}.png",
+        f"{config.output_dir}/flow_{month_label(month)}.png",
         dpi=300,
         bbox_inches="tight",
     )
@@ -779,12 +783,15 @@ def open_spreadsheet() -> Spreadsheet:
 
 
 def write_to_sheet(df: pd.DataFrame, sheet_name: str):
-    # use gspread to write to Google Sheet
+    """Use gspread to write to Google Sheet."""
     print("writing to Google Sheet")
     """
-    ['Timestamp', 'kW', 'month', 'hour', 'yyyymm', 'ymd', 'season', 'period', 'period_type', 'timestamp',
-    'demand', 'start_battery_level', 'end_battery_level', 'solar_generation', 'from_solar', 'from_battery', 'from_grid', 'to_battery', 'to_grid',
-    'ELEC', 'generation credit', 'delivery credit', 'bonus credit', 'pge cost ELEC', 'pge credit', 'grid cost ELEC', 'net cost ELEC', 'savings ELEC',
+    ['Timestamp', 'kW', 'month', 'hour', 'yyyymm', 'ymd', 'season', 'period', 'period_type',
+    'timestamp', 'demand', 'start_battery_level', 'end_battery_level',
+    'solar_generation', 'from_solar',
+    'from_battery', 'from_grid', 'to_battery', 'to_grid',
+    'ELEC', 'generation credit', 'delivery credit', 'bonus credit', 'pge cost ELEC',
+    'pge credit', 'grid cost ELEC', 'net cost ELEC', 'savings ELEC',
     'EV2-A', 'pge cost EV2-A', 'grid cost EV2-A', 'net cost EV2-A', 'savings EV2-A']
     """
     cols = [
@@ -825,7 +832,7 @@ def write_to_sheet(df: pd.DataFrame, sheet_name: str):
     df["Timestamp"] = df["Timestamp"].astype(str)
     # keep only cols
     df = df[cols]
-    df.to_csv(f"{get_output_dir()}/flows-model.csv", index=False)
+    df.to_csv(f"{config.output_dir}/flows-model.csv", index=False)
     ss = open_spreadsheet()
     # create worksheet if it doesn't exist
     if sheet_name not in [worksheet.title for worksheet in ss.worksheets()]:
@@ -896,7 +903,7 @@ def add_costs(
         "EV2-A grid cost",
     """
     df = df[cols]
-    df.to_csv(f"{get_output_dir()}/costs{suffix}.csv", index=False)
+    df.to_csv(f"{config.output_dir}/costs{suffix}.csv", index=False)
     return df
 
 
@@ -955,30 +962,25 @@ def initial_setup(filename: str):
     return df.fillna(0.0)
 
 
-def get_output_dir():
-    return OUTPUT_DIR
-
-
 def generate_summary(
     df_years: pd.DataFrame,
-    config: dict,
     demand: float,
     payback_period: float,
     irr: float,
 ):
     context = {
-        "description": config["description"],
-        "solar": f"{round(SOLAR_CAPACITY):,.0f}",
-        "battery": f"{round(BATTERY_CAPACITY)}",
-        "rate_increase": f"{round(ANNUAL_RATE_INCREASE*100)}",
-        "min_battery_summer": f"{round(MIN_BATTERY_SUMMER)}",
-        "min_battery_winter": f"{round(MIN_BATTERY_WINTER)}",
-        "system_cost": f"{config['system_cost']:,.0f}",
-        "model": f"{config.get('model', 'flow')}",
-        "arbitrage_discharge": f"{config.get('arbitrage_discharge', 0)}",
+        "description": config.description,
+        "solar": f"{round(config.solar_capacity):,.0f}",
+        "battery": f"{round(config.battery_capacity)}",
+        "rate_increase": f"{round(config.annual_rate_increase*100)}",
+        "min_battery_summer": f"{round(config.min_battery_summer)}",
+        "min_battery_winter": f"{round(config.min_battery_winter)}",
+        "system_cost": f"{config.system_cost:,.0f}",
+        "model": f"{config.model}",
+        "arbitrage_discharge": f"{config.arbitrage_discharge}",
         "payback_period": f"{payback_period:.1f}",
         "irr": f"{irr:.2%}",
-        "path": OUTPUT_DIR,
+        "path": config.output_dir,
         "tariff": FORECAST_TARIFF,
         "years": int(len(df_years.index) / 12),
         "demand": f"{demand:,.0f}",
@@ -991,7 +993,7 @@ def generate_summary(
             'bonus rollover credit', 'grid cost', 'net cost', 'savings',
             'cumulative savings', 'cumulative pge', 'cumulative net', 'year']
     """
-    # year 2 results to get full effect of summer credits
+    # year 2 results to apply summer credits
     df_year2 = df_years.iloc[13:24]
     # rollover from last row of df_year2
     last_row = df_year2.iloc[-1]
@@ -1030,26 +1032,24 @@ def generate_summary(
     # render a template with Jinja2
     rendered = jinja2.Template(template).render(context)
     # write to summary.md
-    with open(f"{get_output_dir()}/summary.md", "w") as f:
+    with open(f"{config.output_dir}/summary.md", "w") as f:
         f.write(rendered)
-    print(f"wrote summary to {get_output_dir()}/summary.md")
+    print(f"wrote summary to {config.output_dir}/summary.md")
 
 
 def write_summary_csv(
     df: pd.DataFrame,
     monthly_costs: dict[str, pd.DataFrame],
-    config: dict,
     payback_period: float,
     irr: float,
 ):
     row = {
-        "scenario": config["description"],
-        "annual rate increase": ANNUAL_RATE_INCREASE,
+        "scenario": config.description,
+        "annual rate increase": config.annual_rate_increase,
         "payback period": payback_period,
         "IRR": irr,
         "tariff": FORECAST_TARIFF,
     }
-    # TODO: use year 2 instead of year 1?
     for tariff in RATE_VALUES.keys():
         df_monthly = monthly_costs[tariff]
         net_cost = df_monthly["net cost"].sum()
@@ -1151,7 +1151,7 @@ def write_summary_csv(
 
     """
     df_summary = df_summary[cols]
-    filename = f"{get_output_dir()}/summary.csv"
+    filename = f"{config.output_dir}/summary.csv"
     df_summary.to_csv(filename, index=False)
     print(f"wrote summary to {filename}")
 
@@ -1163,10 +1163,7 @@ def source_label(df: pd.DataFrame, col: str) -> int:
 
 def chart_daily(df: pd.DataFrame, month: date):
     print(f"writing daily chart for {month.strftime('%B')}")
-    # chart 1: battery, solar, demand, excess
-    # sort by Timestamp
     df = df.sort_values(by="Timestamp")
-    # demand = df["demand"].sum()
     cols = [
         "demand",
         "solar_generation",
@@ -1230,22 +1227,18 @@ def chart_daily(df: pd.DataFrame, month: date):
     # label y axis as kWh
     ax.set_ylabel("kWh")
     ax.axhline(0, color="black", linewidth=1)
-    ax.set_title(f"{month.strftime('%B')}: {label_from_params()}")
+    ax.set_title(f"{month.strftime('%B')}: {config.label}")
     ax.set_axisbelow(True)
     ax.grid(axis="y", color="lightgray", alpha=0.7)
     plt.tight_layout()
     # plt.show()
     ax.legend()
     fig.savefig(
-        f"{get_output_dir()}/daily_{month_label(month)}.png",
+        f"{config.output_dir}/daily_{month_label(month)}.png",
         dpi=300,
         bbox_inches="tight",
     )
     plt.close(fig)
-
-
-def label_from_params():
-    return LABEL
 
 
 def cost_chart_setup(ax):
@@ -1269,7 +1262,7 @@ def calculate_monthly_costs(
     delivery_credit: float = 0.0,
     bonus_credit: float = 0.0,
 ) -> pd.DataFrame:
-    # group by month and sum costs by tariff
+    """Group by month and sum costs by tariff."""
     rollover = {
         "generation": generation_credit,
         "delivery": delivery_credit,
@@ -1350,7 +1343,6 @@ def calculate_monthly_costs(
 
 
 def chart_credits(df_monthly: pd.DataFrame, tariff: str, year: int = 1):
-    # credits
     fig, ax = plt.subplots(figsize=(12, 6))
     gen_used = df_monthly["generation credit applied"]
     gen_created = df_monthly[f"{tariff} generation credit"]
@@ -1407,7 +1399,7 @@ def chart_credits(df_monthly: pd.DataFrame, tariff: str, year: int = 1):
     )
     df_monthly["credit per kWh"] = df_monthly["credits created"] / df_monthly["to_grid"]
     df_monthly["credit per kWh"] = df_monthly["credit per kWh"].fillna(0.0)
-    ax.set_title(f"{label_from_params()} export credit: year {year}")
+    ax.set_title(f"{config.label} export credit: year {year}")
     last_row = df_monthly.iloc[-1]
     gen_credit_used = round(gen_used.sum())
     gen_credit_created = round(gen_created.sum())
@@ -1454,7 +1446,7 @@ def chart_credits(df_monthly: pd.DataFrame, tariff: str, year: int = 1):
             va="bottom",
         )
     plt.tight_layout()
-    filename = f"{get_output_dir()}/credits_{year:02d}.png"
+    filename = f"{config.output_dir}/credits_{year:02d}.png"
     fig.savefig(filename, dpi=300, bbox_inches="tight")
     print(f"wrote credits to {filename}")
     plt.close(fig)
@@ -1534,22 +1526,6 @@ def chart_costs(df_monthly: pd.DataFrame, tariff: str, year: int = 1):
         edgecolor="gray",
     )
 
-    """
-    credit = (
-        df_monthly["delivery credit applied"]
-        + df_monthly["generation credit applied"]
-        + df_monthly["bonus credit applied"]
-    )
-    credit_applied = round(credit.sum())
-    ax.plot(
-        df_monthly["month"],
-        credit,
-        label=f"export credit applied ${credit_applied:,.0f}",
-        color=COLORS["from_grid"],
-        # dotted line
-        linestyle="--",
-    )
-    """
     cost_chart_setup(ax)
     ax.set_ylabel("cost $")
     grid_cost = round(df_monthly[f"{tariff} grid cost"].sum())
@@ -1561,7 +1537,7 @@ def chart_costs(df_monthly: pd.DataFrame, tariff: str, year: int = 1):
     generational_total = df_monthly[f"{tariff} generation cost"].sum()
     # group by month, sum net cost {tariff}
     monthly_bill = solar_cost / 12
-    ax.set_title(f"{tariff} cost: {label_from_params()} year {year}")
+    ax.set_title(f"{tariff} cost: {config.label} year {year}")
 
     text = (
         # f"${total_savings:,.0f} annual savings\n"
@@ -1585,7 +1561,7 @@ def chart_costs(df_monthly: pd.DataFrame, tariff: str, year: int = 1):
         color="black",
     )
     plt.tight_layout()
-    filename = f"{get_output_dir()}/costs_{year:02d}.png"
+    filename = f"{config.output_dir}/costs_{year:02d}.png"
     fig.savefig(filename, dpi=300, bbox_inches="tight")
     print(f"wrote costs to {filename}")
     plt.close(fig)
@@ -1611,7 +1587,7 @@ def chart_roi(df: pd.DataFrame, payback_period: float, irr: float):
         color=COLORS["system"],
         label="solar + battery",
     )
-    ax.set_title(f"Cumulative: {label_from_params()}")
+    ax.set_title(f"Cumulative: {config.label}")
     ax.axhline(0, color="black", linewidth=1)
     ax.grid(axis="y", color="lightgray", alpha=0.7)
     ax.set_axisbelow(True)
@@ -1633,18 +1609,23 @@ def chart_roi(df: pd.DataFrame, payback_period: float, irr: float):
         bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
     )
     plt.tight_layout()
-    filename = f"{get_output_dir()}/roi.png"
+    filename = f"{config.output_dir}/roi.png"
     fig.savefig(filename, dpi=300, bbox_inches="tight")
     print(f"wrote {filename}")
     plt.close(fig)
 
 
-def calculate_roi(df: pd.DataFrame, df_arbitrage: pd.DataFrame, config: dict):
-    """
+def calculate_roi(
+    df: pd.DataFrame, df_arbitrage: pd.DataFrame
+) -> tuple[pd.DataFrame, float, float]:
+    """Run model for ROI_YEARS years and calculate ROI.
+
+    Apply annual rate increase and solar degradation factor;
+    rollover credits from previous year.
+
     Timestamp,kW,hour,yyyymm,month,day,ymd,season,period,period_type
     """
     current_year = START_YEAR
-    years = 15
     hourly_output = load_hourly_output()
     df_years = pd.DataFrame()
     rates = {}
@@ -1655,24 +1636,26 @@ def calculate_roi(df: pd.DataFrame, df_arbitrage: pd.DataFrame, config: dict):
     rollover_generation = 0.0
     rollover_delivery = 0.0
     rollover_bonus = 0.0
-    for year in range(years):
+    for year in range(ROI_YEARS):
         if year > 0:
             # reduce the solar generation by the degradation factor
             solar_efficiency = (1 - solar_degradation_factor) ** year
-            # increase the per kwH cost by 4%
+            # increase the per kwH cost by annual rate increase
             for tariff in rates:
                 for period in rates[tariff]:
                     charges = rates[tariff][period]
                     new_charges = Charges(
                         generation=charges.generation
-                        + (charges.generation * ANNUAL_RATE_INCREASE),
+                        + (charges.generation * config.annual_rate_increase),
                         delivery=charges.delivery
-                        + (charges.delivery * ANNUAL_RATE_INCREASE),
-                        other=charges.other + (charges.other * ANNUAL_RATE_INCREASE),
+                        + (charges.delivery * config.annual_rate_increase),
+                        other=charges.other
+                        + (charges.other * config.annual_rate_increase),
                     )
                     rates[tariff][period] = new_charges
         print(
-            f"year {year} solar efficiency: {solar_efficiency} off peak rate: {rates[FORECAST_TARIFF]['winter off peak']}"
+            f"year {year} solar efficiency: {solar_efficiency} "
+            f"off peak rate: {rates[FORECAST_TARIFF]['winter off peak']}"
         )
         df_year = df.copy()
         df_year["Timestamp"] = df["Timestamp"] + pd.Timedelta(days=365 * year)
@@ -1699,7 +1682,8 @@ def calculate_roi(df: pd.DataFrame, df_arbitrage: pd.DataFrame, config: dict):
         rollover_delivery = row["delivery rollover credit"]
         rollover_bonus = row["bonus rollover credit"]
         print(
-            f"{year}: generation rollover credit ${rollover_generation:,.0f}\tdelivery rollover credit ${rollover_delivery:,.0f}"
+            f"{year}: generation rollover credit ${rollover_generation:,.0f}\t"
+            f"delivery rollover credit ${rollover_delivery:,.0f}"
         )
         df_year["year_month"] = df_year["month"].apply(
             lambda x: date(current_year, x, 1)
@@ -1709,9 +1693,7 @@ def calculate_roi(df: pd.DataFrame, df_arbitrage: pd.DataFrame, config: dict):
         current_year += 1
 
     df_years["savings"] = df_years["grid cost"] - df_years["net cost"]
-    df_years["cumulative savings"] = (
-        df_years["savings"].cumsum() - config["system_cost"]
-    )
+    df_years["cumulative savings"] = df_years["savings"].cumsum() - config.system_cost
     df_years["cumulative pge"] = df_years[f"{tariff} grid cost"].cumsum()
     df_years["cumulative net"] = df_years["net cost"].cumsum()
 
@@ -1720,7 +1702,7 @@ def calculate_roi(df: pd.DataFrame, df_arbitrage: pd.DataFrame, config: dict):
     min_timestamp = df["Timestamp"].min().date()
     years = (payback_dt - min_timestamp).days / 365
     print(f"payback period: {payback_dt} ({years:.1f} years)")
-    irr = numpy_financial.irr([-config["system_cost"]] + df_years["savings"].to_list())
+    irr = numpy_financial.irr([-config.system_cost] + df_years["savings"].to_list())
     print(f"IRR: {irr:.2%}")
     cols = [
         "month",
@@ -1743,12 +1725,15 @@ def calculate_roi(df: pd.DataFrame, df_arbitrage: pd.DataFrame, config: dict):
         "cumulative net",
     ]
     df_years = df_years[cols]
-    df_years.to_csv(f"{get_output_dir()}/roi.csv", index=False)
+    df_years.to_csv(f"{config.output_dir}/roi.csv", index=False)
     return df_years, years, irr
 
 
 def load_arbitrage_targets(arbitrage_discharge: float) -> pd.DataFrame:
-    max_discharge = min(BATTERY_CAPACITY * BATTERY_DISCHARGE_RATIO, arbitrage_discharge)
+    """Load arbitrage targets and set target discharge."""
+    max_discharge = min(
+        config.battery_capacity * BATTERY_DISCHARGE_RATIO, arbitrage_discharge
+    )
     remainder_discharge = min(0, arbitrage_discharge - max_discharge)
     df = pd.read_csv("data/arbitrage_targets.csv", parse_dates=["DateTime"])
     # sort by total_credit descending then by DateTime ascending
@@ -1787,13 +1772,15 @@ def calculate_tariff_monthly_costs(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
             "grid cost",
         ]
         df_monthly = df_monthly[cols]
-        df_monthly.to_csv(f"{get_output_dir()}/monthly_costs_{tariff}.csv", index=False)
+        df_monthly.to_csv(
+            f"{config.output_dir}/monthly_costs_{tariff}.csv", index=False
+        )
         monthly_costs[tariff] = df_monthly
     return monthly_costs
 
 
-def main(config: dict):
-    df_initial = initial_setup(config.get("usage", DEFAULT_USAGE))
+def main():
+    df_initial = initial_setup(config.usage_filename)
     df_initial = label_periods(df_initial)
     df_initial["solar_efficiency"] = 1.0
     cols = [
@@ -1805,13 +1792,11 @@ def main(config: dict):
         "solar_efficiency",
     ] + date_helpers()
     df_initial = df_initial[cols]
-    df_initial.to_csv(f"{get_output_dir()}/initial.csv", index=False)
+    df_initial.to_csv(f"{config.output_dir}/initial.csv", index=False)
     hourly_output = load_hourly_output()
 
-    if config.get("model", "flow") == "arbitrage":
-        df_arbitrage = load_arbitrage_targets(
-            config.get("arbitrage_discharge", BATTERY_CAPACITY)
-        )
+    if config.model == "arbitrage":
+        df_arbitrage = load_arbitrage_targets(config.arbitrage_discharge)
     else:
         df_arbitrage = pd.DataFrame()
 
@@ -1824,10 +1809,10 @@ def main(config: dict):
     chart_costs(df_monthly, FORECAST_TARIFF)
     chart_credits(df_monthly, FORECAST_TARIFF)
 
-    df_roi, payback_period, irr = calculate_roi(df_initial, df_arbitrage, config)
+    df_roi, payback_period, irr = calculate_roi(df_initial, df_arbitrage)
     chart_roi(df_roi, payback_period, irr)
-    write_summary_csv(df, monthly_costs, config, payback_period, irr)
-    generate_summary(df_roi, config, df_initial["demand"].sum(), payback_period, irr)
+    write_summary_csv(df, monthly_costs, payback_period, irr)
+    generate_summary(df_roi, df_initial["demand"].sum(), payback_period, irr)
 
     chart_monthly_sources(df)
 
@@ -1837,16 +1822,37 @@ def main(config: dict):
         chart_flows(group, date(START_YEAR, month, 1), max_y=max_y)
         chart_daily(group, date(START_YEAR, month, 1))
 
-    # TODO: run these optionally based on flag
+    # TODO: these are slow; run these optionally based on flag
     # chart_solar_hourly()
     # write_to_sheet(df, config["output"])
-    print(f"\nwrote outputs to {get_output_dir()}")
+    print(f"\nwrote outputs to {config.output_dir}")
 
 
 def load_config(filename: str):
     with open(filename, "r") as f:
-        config = yaml.safe_load(f)
-    return config
+        config_dict = yaml.safe_load(f)
+    config.output_dir = config_dict.get("output", config.output_dir)
+    if not os.path.exists(config.output_dir):
+        os.makedirs(config.output_dir)
+    config.annual_rate_increase = config_dict.get(
+        "annual_rate_increase", config.annual_rate_increase
+    )
+    config.arbitrage_discharge = config_dict.get(
+        "arbitrage_discharge", config.arbitrage_discharge
+    )
+    config.battery_capacity = config_dict.get("battery", config.battery_capacity)
+    config.description = config_dict.get("description", config.description)
+    config.min_battery_winter = config_dict.get(
+        "min_battery_winter", config.min_battery_winter
+    )
+    config.min_battery_summer = config_dict.get(
+        "min_battery_summer", config.min_battery_summer
+    )
+    config.model = config_dict.get("model", config.model)
+    config.output_dir = config_dict.get("output", config.output_dir)
+    config.solar_capacity = config_dict.get("solar", config.solar_capacity)
+    config.usage_filename = config_dict.get("usage_filename", config.usage_filename)
+    config.system_cost = config_dict.get("system_cost", config.system_cost)
 
 
 if __name__ == "__main__":
@@ -1855,6 +1861,5 @@ if __name__ == "__main__":
         "config", type=str, default="solar-10-battery-30.yml", nargs="?"
     )
     args = parser.parse_args()
-    _config = load_config(args.config)
-    set_params(_config)
-    main(_config)
+    load_config(args.config)
+    main()
