@@ -1,0 +1,8 @@
+output: solar-10-battery-45
+description: "10 kW solar, 45 kWh battery"
+solar: 10
+battery: 45
+fill_off_peak: 0
+min_battery_summer: 2
+min_battery_winter: 11
+system_cost: 56925.96

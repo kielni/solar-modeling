@@ -1,0 +1,9 @@
+output: arbitrage-limit-10
+description: "8 kW solar, 30 kWh battery, 10 kWh arbitrage"
+arbitrage_discharge: 10.0
+solar: 8
+battery: 30
+min_battery_summer: 2
+min_battery_winter: 11
+system_cost: 36631.96
+model: arbitrage

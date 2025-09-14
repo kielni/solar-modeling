@@ -1,0 +1,9 @@
+output: solar-8-battery-30-rate-8
+description: "8 kW solar, 30 kWh battery, 8% rate increase"
+solar: 8
+battery: 30
+fill_off_peak: 0
+min_battery_summer: 2
+min_battery_winter: 11
+system_cost: 36631.96
+annual_rate_increase: 0.08

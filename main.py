@@ -111,8 +111,7 @@ PEAK_USAGE = 10.0
 DAILY_USE = 43.0
 FORECAST_TARIFF = "ELEC"
 
-# TODO: move this to environment variable
-SHEET_ID = "1vSV4EjU8OsduAFK0HzzNbDCx9E8KZpzjp8XyiYHbehQ"
+SHEET_ID = os.getenv("SHEET_ID")
 
 FIRST_PEAK_HOUR = 15
 # max 10 kW per 15 kWh battery
@@ -784,6 +783,9 @@ def open_spreadsheet() -> Spreadsheet:
 
 def write_to_sheet(df: pd.DataFrame, sheet_name: str):
     """Use gspread to write to Google Sheet."""
+    if not SHEET_ID:
+        print("SHEET_ID not set, skipping Google Sheet write")
+        return
     print("writing to Google Sheet")
     """
     ['Timestamp', 'kW', 'month', 'hour', 'yyyymm', 'ymd', 'season', 'period', 'period_type',
@@ -1537,7 +1539,14 @@ def chart_costs(df_monthly: pd.DataFrame, tariff: str, year: int = 1):
     generational_total = df_monthly[f"{tariff} generation cost"].sum()
     # group by month, sum net cost {tariff}
     monthly_bill = solar_cost / 12
-    ax.set_title(f"{tariff} cost: {config.label} year {year}")
+    arbitrage = (
+        f" {round(config.arbitrage_discharge)} kWh arbitrage"
+        if config.arbitrage_discharge
+        else ""
+    )
+    title = f"{tariff} cost: {config.label}{arbitrage} year {year}"
+    print(f"writing {title}")
+    ax.set_title(title)
 
     text = (
         # f"${total_savings:,.0f} annual savings\n"
@@ -1822,9 +1831,8 @@ def main():
         chart_flows(group, date(START_YEAR, month, 1), max_y=max_y)
         chart_daily(group, date(START_YEAR, month, 1))
 
-    # TODO: these are slow; run these optionally based on flag
-    # chart_solar_hourly()
-    # write_to_sheet(df, config["output"])
+    chart_solar_hourly()
+    write_to_sheet(df, config.output_dir)
     print(f"\nwrote outputs to {config.output_dir}")
 
 

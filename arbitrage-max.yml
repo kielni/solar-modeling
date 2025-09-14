@@ -1,0 +1,9 @@
+output: arbitrage-max
+description: "8 kW solar, 30 kWh battery, max arbitrage"
+solar: 8
+battery: 30
+arbitrage_discharge: 30.0
+min_battery_summer: 2
+min_battery_winter: 11
+system_cost: 36631.96
+model: arbitrage
